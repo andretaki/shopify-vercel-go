@@ -42,7 +42,14 @@ type Response struct {
 	Success bool        `json:"success"`
 	Message string      `json:"message"`
 	Stats   interface{} `json:"stats,omitempty"`
-	Error   string      `json:"error,omitempty"`
+	Errors  []SyncError `json:"errors,omitempty"` // Changed from string to []SyncError
+}
+
+// SyncError represents a detailed error from a sync operation
+type SyncError struct {
+	Type    string `json:"type"`              // The type of sync that failed (products, customers, etc.)
+	Message string `json:"message"`           // The error message
+	Details string `json:"details,omitempty"` // Additional error details if available
 }
 
 // Handler is the entrypoint for the Vercel serverless function
@@ -83,13 +90,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// Stats to track what was imported
 	stats := make(map[string]int)
-	var syncErrors []string
+	var syncErrors []SyncError
 
 	// Execute requested sync operations
 	if syncType == "all" || syncType == "products" {
 		productCount, err := syncProducts(ctx, conn, today)
 		if err != nil {
-			syncErrors = append(syncErrors, fmt.Sprintf("error syncing products: %v", err))
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "products",
+				Message: fmt.Sprintf("Failed to sync products: %v", err),
+				Details: err.Error(),
+			})
 		} else {
 			stats["products"] = productCount
 		}
@@ -98,7 +109,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	if syncType == "all" || syncType == "customers" {
 		customerCount, err := syncCustomers(ctx, conn, today)
 		if err != nil {
-			syncErrors = append(syncErrors, fmt.Sprintf("error syncing customers: %v", err))
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "customers",
+				Message: fmt.Sprintf("Failed to sync customers: %v", err),
+				Details: err.Error(),
+			})
 		} else {
 			stats["customers"] = customerCount
 		}
@@ -107,7 +122,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	if syncType == "all" || syncType == "orders" {
 		orderCount, err := syncOrders(ctx, conn, today)
 		if err != nil {
-			syncErrors = append(syncErrors, fmt.Sprintf("error syncing orders: %v", err))
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "orders",
+				Message: fmt.Sprintf("Failed to sync orders: %v", err),
+				Details: err.Error(),
+			})
 		} else {
 			stats["orders"] = orderCount
 		}
@@ -116,18 +135,24 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	if syncType == "all" || syncType == "collections" {
 		collectionCount, err := syncCollections(ctx, conn, today)
 		if err != nil {
-			syncErrors = append(syncErrors, fmt.Sprintf("error syncing collections: %v", err))
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "collections",
+				Message: fmt.Sprintf("Failed to sync collections: %v", err),
+				Details: err.Error(),
+			})
 		} else {
 			stats["collections"] = collectionCount
 		}
 	}
 
-	// Note: syncBlogArticles was removed from the default "all" type in the original code structure provided in prompt,
-	// adding it back here assuming it was intended. Adjust if needed.
 	if syncType == "all" || syncType == "blogs" {
 		blogCount, err := syncBlogArticles(ctx, conn, today)
 		if err != nil {
-			syncErrors = append(syncErrors, fmt.Sprintf("error syncing blog articles: %v", err))
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "blogs",
+				Message: fmt.Sprintf("Failed to sync blog articles: %v", err),
+				Details: err.Error(),
+			})
 		} else {
 			stats["blog_articles"] = blogCount
 		}
@@ -137,11 +162,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	response := Response{
 		Success: len(syncErrors) == 0,
 		Stats:   stats,
+		Errors:  syncErrors,
 	}
 
 	if len(syncErrors) > 0 {
-		response.Error = strings.Join(syncErrors, "; ")
-		response.Message = fmt.Sprintf("Completed Shopify export on %s with errors.", today)
+		response.Message = fmt.Sprintf("Completed Shopify export on %s with %d errors.", today, len(syncErrors))
 		w.WriteHeader(http.StatusInternalServerError)
 	} else {
 		response.Message = fmt.Sprintf("Successfully exported Shopify data on %s", today)
@@ -156,16 +181,20 @@ func respondWithError(w http.ResponseWriter, code int, err error) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(Response{
 		Success: false,
-		Error:   err.Error(),
+		Errors: []SyncError{{
+			Type:    "system",
+			Message: "System error occurred",
+			Details: err.Error(),
+		}},
 	})
 }
 
 func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 	// Create products table
 	_, err := conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_products (
+		CREATE TABLE IF NOT EXISTS shopify_sync_products (
 			id SERIAL PRIMARY KEY,
-			product_id BIGINT UNIQUE, -- Added UNIQUE constraint
+			product_id BIGINT UNIQUE,
 			title TEXT,
 			description TEXT,
 			product_type TEXT,
@@ -173,14 +202,14 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 			handle TEXT,
 			status TEXT,
 			tags TEXT,
-			published_at TIMESTAMPTZ, -- Use TIMESTAMPTZ for timezones
+			published_at TIMESTAMPTZ,
 			created_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ,
 			variants JSONB,
 			images JSONB,
 			options JSONB,
 			metafields JSONB,
-			sync_date DATE NOT NULL -- Added NOT NULL
+			sync_date DATE NOT NULL
 		)
 	`)
 	if err != nil {
@@ -189,9 +218,9 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 
 	// Create customers table
 	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_customers (
+		CREATE TABLE IF NOT EXISTS shopify_sync_customers (
 			id SERIAL PRIMARY KEY,
-			customer_id BIGINT UNIQUE, -- Added UNIQUE constraint
+			customer_id BIGINT UNIQUE,
 			first_name TEXT,
 			last_name TEXT,
 			email TEXT,
@@ -199,8 +228,8 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 			verified_email BOOLEAN,
 			accepts_marketing BOOLEAN,
 			orders_count INTEGER,
-			state TEXT, -- Consider standardizing state field (e.g., ACTIVE, DISABLED)
-			total_spent DECIMAL(12,2), -- Increased precision
+			state TEXT,
+			total_spent DECIMAL(12,2),
 			note TEXT,
 			addresses JSONB,
 			default_address JSONB,
@@ -218,19 +247,19 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 
 	// Create orders table
 	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_orders (
+		CREATE TABLE IF NOT EXISTS shopify_sync_orders (
 			id SERIAL PRIMARY KEY,
-			order_id BIGINT UNIQUE, -- Added UNIQUE constraint
+			order_id BIGINT UNIQUE,
 			name TEXT,
 			order_number INTEGER,
-			customer_id BIGINT, -- Consider adding foreign key constraint if customers are always synced first
+			customer_id BIGINT,
 			email TEXT,
 			phone TEXT,
 			financial_status TEXT,
 			fulfillment_status TEXT,
 			processed_at TIMESTAMPTZ,
 			currency TEXT,
-			total_price DECIMAL(12,2), -- Increased precision
+			total_price DECIMAL(12,2),
 			subtotal_price DECIMAL(12,2),
 			total_tax DECIMAL(12,2),
 			total_discounts DECIMAL(12,2),
@@ -239,7 +268,7 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 			shipping_address JSONB,
 			line_items JSONB,
 			shipping_lines JSONB,
-			discount_applications JSONB, -- Renamed from discount_codes to match GraphQL query
+			discount_applications JSONB,
 			note TEXT,
 			tags TEXT,
 			created_at TIMESTAMPTZ,
@@ -253,21 +282,19 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 
 	// Create collections table
 	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_collections (
+		CREATE TABLE IF NOT EXISTS shopify_sync_collections (
 			id SERIAL PRIMARY KEY,
-			collection_id BIGINT UNIQUE, -- Added UNIQUE constraint
+			collection_id BIGINT UNIQUE,
 			title TEXT,
 			handle TEXT,
 			description TEXT,
-			description_html TEXT, -- Added from query
-			products_count INT, -- Added from query
-			-- collection_type TEXT, -- Removed, seemed redundant with ruleSet presence
+			description_html TEXT,
+			products_count INT,
 			products JSONB,
-			rule_set JSONB, -- Renamed from rules to match GraphQL query
+			rule_set JSONB,
 			sort_order TEXT,
 			published_at TIMESTAMPTZ,
 			template_suffix TEXT,
-			-- created_at TIMESTAMPTZ, -- Not available directly in the collection node
 			updated_at TIMESTAMPTZ,
 			sync_date DATE NOT NULL
 		)
@@ -278,7 +305,7 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 
 	// Create blog articles table
 	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_blog_articles (
+		CREATE TABLE IF NOT EXISTS shopify_sync_blog_articles (
 			id SERIAL PRIMARY KEY,
 			blog_id BIGINT,
 			article_id BIGINT,
@@ -286,14 +313,13 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 			title TEXT,
 			author TEXT,
 			content TEXT,
-			content_html TEXT, -- Added from query
+			content_html TEXT,
 			excerpt TEXT,
 			handle TEXT,
 			image JSONB,
 			tags TEXT,
 			seo JSONB,
-			-- published BOOLEAN, -- Use status from query
-			status TEXT, -- Added from query
+			status TEXT,
 			published_at TIMESTAMPTZ,
 			created_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ,
@@ -301,7 +327,7 @@ func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
 			summary_html TEXT,
 			template_suffix TEXT,
 			sync_date DATE NOT NULL,
-			UNIQUE (blog_id, article_id) -- Added UNIQUE constraint
+			UNIQUE (blog_id, article_id)
 		)
 	`)
 	if err != nil {
@@ -355,8 +381,8 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 		return nil, fmt.Errorf("SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN environment variable not set")
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}                                // Increased timeout
-	graphqlURL := fmt.Sprintf("https://%s/admin/api/2024-04/graphql.json", shopName) // Use a recent stable API version
+	client := &http.Client{Timeout: 60 * time.Second}
+	graphqlURL := fmt.Sprintf("https://%s/admin/api/2024-04/graphql.json", shopName)
 
 	requestBody := GraphQLRequest{
 		Query:     query,
@@ -376,61 +402,81 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error calling Shopify GraphQL API: %v", err)
-	}
-	defer resp.Body.Close()
+	// Add retry mechanism with max attempts
+	maxRetries := 3
+	var lastErr error
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %v", err)
-	}
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			time.Sleep(backoff)
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		// Try to parse the error response for more details
-		var errResp GraphQLResponse
-		if json.Unmarshal(body, &errResp) == nil && len(errResp.Errors) > 0 {
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("error calling Shopify GraphQL API: %v", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			lastErr = fmt.Errorf("error reading response body: %v", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			// Try to parse the error response for more details
+			var errResp GraphQLResponse
+			if json.Unmarshal(body, &errResp) == nil && len(errResp.Errors) > 0 {
+				var errorMessages []string
+				for _, gqlErr := range errResp.Errors {
+					errorMessages = append(errorMessages, gqlErr.Message)
+				}
+				lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, strings.Join(errorMessages, "; "))
+			} else {
+				lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+			}
+			continue
+		}
+
+		var graphqlResp GraphQLResponse
+		if err := json.Unmarshal(body, &graphqlResp); err != nil {
+			lastErr = fmt.Errorf("error parsing JSON response: %v. Response body: %s", err, string(body))
+			continue
+		}
+
+		// Handle rate limits
+		if waitTime, err := handleRateLimit(graphqlResp.Extensions); err != nil {
+			lastErr = err
+			continue
+		} else if waitTime > 0 {
+			if attempt < maxRetries-1 { // Only wait if we have more attempts left
+				time.Sleep(waitTime)
+				continue
+			}
+		}
+
+		// Check for GraphQL errors even with 200 OK status
+		if len(graphqlResp.Errors) > 0 {
 			var errorMessages []string
-			for _, gqlErr := range errResp.Errors {
+			for _, gqlErr := range graphqlResp.Errors {
 				errorMessages = append(errorMessages, gqlErr.Message)
 			}
-			return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, strings.Join(errorMessages, "; "))
+			lastErr = fmt.Errorf("GraphQL errors encountered: %s", strings.Join(errorMessages, "; "))
+			continue
 		}
-		// Fallback if error parsing fails
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
 
-	var graphqlResp GraphQLResponse
-	if err := json.Unmarshal(body, &graphqlResp); err != nil {
-		return nil, fmt.Errorf("error parsing JSON response: %v. Response body: %s", err, string(body))
-	}
-
-	// Handle rate limits
-	if waitTime, err := handleRateLimit(graphqlResp.Extensions); err != nil {
-		return nil, err
-	} else if waitTime > 0 {
-		time.Sleep(waitTime)
-		// Retry the query after waiting
-		return executeGraphQLQuery(query, variables)
-	}
-
-	// Check for GraphQL errors even with 200 OK status
-	if len(graphqlResp.Errors) > 0 {
-		var errorMessages []string
-		for _, gqlErr := range graphqlResp.Errors {
-			errorMessages = append(errorMessages, gqlErr.Message)
+		if graphqlResp.Data == nil {
+			lastErr = fmt.Errorf("received nil data in GraphQL response")
+			continue
 		}
-		// Log the full error details if needed
-		// log.Printf("GraphQL Errors: %+v\n", graphqlResp.Errors)
-		return nil, fmt.Errorf("GraphQL errors encountered: %s", strings.Join(errorMessages, "; "))
+
+		return graphqlResp.Data, nil
 	}
 
-	if graphqlResp.Data == nil {
-		return nil, fmt.Errorf("received nil data in GraphQL response")
-	}
-
-	return graphqlResp.Data, nil
+	return nil, fmt.Errorf("max retries (%d) exceeded. Last error: %v", maxRetries, lastErr)
 }
 
 // Helper function to safely extract fields and handle potential nil values or type mismatches
@@ -520,8 +566,8 @@ func safeGetJSONB(data map[string]interface{}, key string) []byte {
 }
 
 func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
-	// Start with a smaller page size for complex queries
-	pageSize := 20
+	// Reduced page size for better rate limit handling
+	pageSize := 20 // Reduced from 50 to 20
 	query := fmt.Sprintf(`
 		query GetProducts($cursor: String) {
 			products(first: %d, after: $cursor) {
@@ -542,14 +588,14 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 						publishedAt
 						createdAt
 						updatedAt
-						variants(first: 10) {  // Reduced from 50
+						variants(first: 100) {  // Reduced from 250 to 100
 							edges { node { id title price inventoryQuantity sku barcode weight weightUnit requiresShipping taxable } }
 						}
-						images(first: 5) {     // Reduced from 20
+						images(first: 100) {     // Reduced from 250 to 100
 							edges { node { id src altText width height } }
 						}
 						options { id name values }
-						metafields(first: 10) { // Reduced from 50
+						metafields(first: 100) { // Reduced from 250 to 100
 							edges { node { id namespace key value type } }
 						}
 					}
@@ -628,7 +674,7 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 
 			// Use UPSERT for efficiency
 			_, err = tx.Exec(ctx, `
-				INSERT INTO shopify_products (
+				INSERT INTO shopify_sync_products (
 					product_id, title, description, product_type, vendor, handle,
 					status, tags, variants, images, options, metafields,
 					published_at, created_at, updated_at, sync_date
@@ -651,20 +697,20 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 					sync_date = EXCLUDED.sync_date
 				WHERE
 					-- Only update if data actually changed to reduce DB churn
-					( shopify_products.title IS DISTINCT FROM EXCLUDED.title OR
-					  shopify_products.description IS DISTINCT FROM EXCLUDED.description OR
-					  shopify_products.product_type IS DISTINCT FROM EXCLUDED.product_type OR
-					  shopify_products.vendor IS DISTINCT FROM EXCLUDED.vendor OR
-					  shopify_products.handle IS DISTINCT FROM EXCLUDED.handle OR
-					  shopify_products.status IS DISTINCT FROM EXCLUDED.status OR
-					  shopify_products.tags IS DISTINCT FROM EXCLUDED.tags OR
-					  shopify_products.variants IS DISTINCT FROM EXCLUDED.variants OR
-					  shopify_products.images IS DISTINCT FROM EXCLUDED.images OR
-					  shopify_products.options IS DISTINCT FROM EXCLUDED.options OR
-					  shopify_products.metafields IS DISTINCT FROM EXCLUDED.metafields OR
-					  shopify_products.published_at IS DISTINCT FROM EXCLUDED.published_at OR
-					  shopify_products.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
-					  shopify_products.sync_date != EXCLUDED.sync_date
+					( shopify_sync_products.title IS DISTINCT FROM EXCLUDED.title OR
+					  shopify_sync_products.description IS DISTINCT FROM EXCLUDED.description OR
+					  shopify_sync_products.product_type IS DISTINCT FROM EXCLUDED.product_type OR
+					  shopify_sync_products.vendor IS DISTINCT FROM EXCLUDED.vendor OR
+					  shopify_sync_products.handle IS DISTINCT FROM EXCLUDED.handle OR
+					  shopify_sync_products.status IS DISTINCT FROM EXCLUDED.status OR
+					  shopify_sync_products.tags IS DISTINCT FROM EXCLUDED.tags OR
+					  shopify_sync_products.variants IS DISTINCT FROM EXCLUDED.variants OR
+					  shopify_sync_products.images IS DISTINCT FROM EXCLUDED.images OR
+					  shopify_sync_products.options IS DISTINCT FROM EXCLUDED.options OR
+					  shopify_sync_products.metafields IS DISTINCT FROM EXCLUDED.metafields OR
+					  shopify_sync_products.published_at IS DISTINCT FROM EXCLUDED.published_at OR
+					  shopify_sync_products.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+					  shopify_sync_products.sync_date != EXCLUDED.sync_date
 					)
 			`,
 				productID, title, description, productType, vendor, handle,
@@ -712,17 +758,17 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	query := `
 		query GetCustomers($cursor: String) {
-			customers(first: 50, after: $cursor) {
+			customers(first: 20, after: $cursor) { // Reduced from 50 to 20
 				pageInfo { hasNextPage endCursor }
 				edges {
 					node {
-						id firstName lastName email phone verifiedEmail acceptsMarketing ordersCount state totalSpent { amount } # Changed totalSpent to object
+						id firstName lastName email phone verifiedEmail acceptsMarketing ordersCount state totalSpent { amount }
 						note
 						addresses { address1 address2 city country countryCode province provinceCode zip phone company }
 						defaultAddress { address1 address2 city country countryCode province provinceCode zip phone company }
-						taxExemptions # Is an enum array
+						taxExemptions
 						taxExempt
-						tags # Is an array
+						tags
 						createdAt updatedAt
 					}
 				}
@@ -800,7 +846,7 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 
 			// Use UPSERT
 			_, err = tx.Exec(ctx, `
-				INSERT INTO shopify_customers (
+				INSERT INTO shopify_sync_customers (
 					customer_id, first_name, last_name, email, phone,
 					verified_email, accepts_marketing, orders_count, state,
 					total_spent, note, addresses, default_address,
@@ -814,23 +860,23 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 					tax_exemptions = EXCLUDED.tax_exemptions, tax_exempt = EXCLUDED.tax_exempt, tags = EXCLUDED.tags, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at,
 					sync_date = EXCLUDED.sync_date
 				WHERE
-					( shopify_customers.first_name IS DISTINCT FROM EXCLUDED.first_name OR
-					  shopify_customers.last_name IS DISTINCT FROM EXCLUDED.last_name OR
-                      shopify_customers.email IS DISTINCT FROM EXCLUDED.email OR
-                      shopify_customers.phone IS DISTINCT FROM EXCLUDED.phone OR
-					  shopify_customers.verified_email IS DISTINCT FROM EXCLUDED.verified_email OR
-					  shopify_customers.accepts_marketing IS DISTINCT FROM EXCLUDED.accepts_marketing OR
-					  shopify_customers.orders_count IS DISTINCT FROM EXCLUDED.orders_count OR
-					  shopify_customers.state IS DISTINCT FROM EXCLUDED.state OR
-					  shopify_customers.total_spent IS DISTINCT FROM EXCLUDED.total_spent OR
-					  shopify_customers.note IS DISTINCT FROM EXCLUDED.note OR
-					  shopify_customers.addresses IS DISTINCT FROM EXCLUDED.addresses OR
-					  shopify_customers.default_address IS DISTINCT FROM EXCLUDED.default_address OR
-					  shopify_customers.tax_exemptions IS DISTINCT FROM EXCLUDED.tax_exemptions OR
-					  shopify_customers.tax_exempt IS DISTINCT FROM EXCLUDED.tax_exempt OR
-					  shopify_customers.tags IS DISTINCT FROM EXCLUDED.tags OR
-					  shopify_customers.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
-					  shopify_customers.sync_date != EXCLUDED.sync_date
+					( shopify_sync_customers.first_name IS DISTINCT FROM EXCLUDED.first_name OR
+					  shopify_sync_customers.last_name IS DISTINCT FROM EXCLUDED.last_name OR
+                      shopify_sync_customers.email IS DISTINCT FROM EXCLUDED.email OR
+                      shopify_sync_customers.phone IS DISTINCT FROM EXCLUDED.phone OR
+					  shopify_sync_customers.verified_email IS DISTINCT FROM EXCLUDED.verified_email OR
+					  shopify_sync_customers.accepts_marketing IS DISTINCT FROM EXCLUDED.accepts_marketing OR
+					  shopify_sync_customers.orders_count IS DISTINCT FROM EXCLUDED.orders_count OR
+					  shopify_sync_customers.state IS DISTINCT FROM EXCLUDED.state OR
+					  shopify_sync_customers.total_spent IS DISTINCT FROM EXCLUDED.total_spent OR
+					  shopify_sync_customers.note IS DISTINCT FROM EXCLUDED.note OR
+					  shopify_sync_customers.addresses IS DISTINCT FROM EXCLUDED.addresses OR
+					  shopify_sync_customers.default_address IS DISTINCT FROM EXCLUDED.default_address OR
+					  shopify_sync_customers.tax_exemptions IS DISTINCT FROM EXCLUDED.tax_exemptions OR
+					  shopify_sync_customers.tax_exempt IS DISTINCT FROM EXCLUDED.tax_exempt OR
+					  shopify_sync_customers.tags IS DISTINCT FROM EXCLUDED.tags OR
+					  shopify_sync_customers.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+					  shopify_sync_customers.sync_date != EXCLUDED.sync_date
 					)
 
 			`,
@@ -877,17 +923,16 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 }
 
 func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
-	// Updated query to use the helper function's expected structure
 	query := `
 		query GetOrders($cursor: String) {
-			orders(first: 20, after: $cursor) { # Reduced page size slightly
+			orders(first: 10, after: $cursor) { // Reduced from 20 to 10
 				pageInfo { hasNextPage endCursor }
 				edges {
 					node {
 						id name orderNumber
 						customer { id }
 						email phone financialStatus fulfillmentStatus processedAt
-						currencyCode # Changed from currency
+						currencyCode
 						totalPriceSet { shopMoney { amount currencyCode } }
 						subtotalPriceSet { shopMoney { amount currencyCode } }
 						totalTaxSet { shopMoney { amount currencyCode } }
@@ -895,9 +940,9 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 						totalShippingPriceSet { shopMoney { amount currencyCode } }
 						billingAddress { address1 address2 city company country countryCode firstName lastName phone province provinceCode zip }
 						shippingAddress { address1 address2 city company country countryCode firstName lastName phone province provinceCode zip }
-						lineItems(first: 100) { edges { node { id title quantity variant { id sku barcode } originalTotalSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } } } } }
-						shippingLines(first: 10) { edges { node { id title carrierIdentifier originalPriceSet { shopMoney { amount } } discountedPriceSet { shopMoney { amount } } } } }
-						discountApplications(first: 10) { edges { node { __typename ... on DiscountApplication { value { ... on MoneyV2 { amount currencyCode } ... on PricingPercentageValue { percentage } } ... on AutomaticDiscountApplication { title } ... on ManualDiscountApplication { title description } ... on ScriptDiscountApplication { title } ... on DiscountCodeApplication { code applicable } } } } } # Improved discount handling
+						lineItems(first: 50) { edges { node { id title quantity variant { id sku barcode } originalTotalSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } } } } } // Reduced from 100 to 50
+						shippingLines(first: 5) { edges { node { id title carrierIdentifier originalPriceSet { shopMoney { amount } } discountedPriceSet { shopMoney { amount } } } } } // Reduced from 10 to 5
+						discountApplications(first: 5) { edges { node { __typename ... on DiscountApplication { value { ... on MoneyV2 { amount currencyCode } ... on PricingPercentageValue { percentage } } ... on AutomaticDiscountApplication { title } ... on ManualDiscountApplication { title description } ... on ScriptDiscountApplication { title } ... on DiscountCodeApplication { code applicable } } } } } // Reduced from 10 to 5
 						note tags createdAt updatedAt
 					}
 				}
@@ -986,7 +1031,7 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 
 			// Use UPSERT
 			_, err = tx.Exec(ctx, `
-				INSERT INTO shopify_orders (
+				INSERT INTO shopify_sync_orders (
 					order_id, name, order_number, customer_id, email, phone,
 					financial_status, fulfillment_status, processed_at,
 					currency, total_price, subtotal_price, total_tax,
@@ -1004,29 +1049,29 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 					discount_applications = EXCLUDED.discount_applications, note = EXCLUDED.note, tags = EXCLUDED.tags, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at,
 					sync_date = EXCLUDED.sync_date
                 WHERE
-                    ( shopify_orders.name IS DISTINCT FROM EXCLUDED.name OR
-                      shopify_orders.order_number IS DISTINCT FROM EXCLUDED.order_number OR
-                      shopify_orders.customer_id IS DISTINCT FROM EXCLUDED.customer_id OR
-                      shopify_orders.email IS DISTINCT FROM EXCLUDED.email OR
-                      shopify_orders.phone IS DISTINCT FROM EXCLUDED.phone OR
-                      shopify_orders.financial_status IS DISTINCT FROM EXCLUDED.financial_status OR
-                      shopify_orders.fulfillment_status IS DISTINCT FROM EXCLUDED.fulfillment_status OR
-                      shopify_orders.processed_at IS DISTINCT FROM EXCLUDED.processed_at OR
-                      shopify_orders.currency IS DISTINCT FROM EXCLUDED.currency OR
-                      shopify_orders.total_price IS DISTINCT FROM EXCLUDED.total_price OR
-                      shopify_orders.subtotal_price IS DISTINCT FROM EXCLUDED.subtotal_price OR
-                      shopify_orders.total_tax IS DISTINCT FROM EXCLUDED.total_tax OR
-                      shopify_orders.total_discounts IS DISTINCT FROM EXCLUDED.total_discounts OR
-                      shopify_orders.total_shipping IS DISTINCT FROM EXCLUDED.total_shipping OR
-                      shopify_orders.billing_address IS DISTINCT FROM EXCLUDED.billing_address OR
-                      shopify_orders.shipping_address IS DISTINCT FROM EXCLUDED.shipping_address OR
-                      shopify_orders.line_items IS DISTINCT FROM EXCLUDED.line_items OR
-                      shopify_orders.shipping_lines IS DISTINCT FROM EXCLUDED.shipping_lines OR
-                      shopify_orders.discount_applications IS DISTINCT FROM EXCLUDED.discount_applications OR
-                      shopify_orders.note IS DISTINCT FROM EXCLUDED.note OR
-                      shopify_orders.tags IS DISTINCT FROM EXCLUDED.tags OR
-                      shopify_orders.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
-					  shopify_orders.sync_date != EXCLUDED.sync_date
+                    ( shopify_sync_orders.name IS DISTINCT FROM EXCLUDED.name OR
+                      shopify_sync_orders.order_number IS DISTINCT FROM EXCLUDED.order_number OR
+                      shopify_sync_orders.customer_id IS DISTINCT FROM EXCLUDED.customer_id OR
+                      shopify_sync_orders.email IS DISTINCT FROM EXCLUDED.email OR
+                      shopify_sync_orders.phone IS DISTINCT FROM EXCLUDED.phone OR
+                      shopify_sync_orders.financial_status IS DISTINCT FROM EXCLUDED.financial_status OR
+                      shopify_sync_orders.fulfillment_status IS DISTINCT FROM EXCLUDED.fulfillment_status OR
+                      shopify_sync_orders.processed_at IS DISTINCT FROM EXCLUDED.processed_at OR
+                      shopify_sync_orders.currency IS DISTINCT FROM EXCLUDED.currency OR
+                      shopify_sync_orders.total_price IS DISTINCT FROM EXCLUDED.total_price OR
+                      shopify_sync_orders.subtotal_price IS DISTINCT FROM EXCLUDED.subtotal_price OR
+                      shopify_sync_orders.total_tax IS DISTINCT FROM EXCLUDED.total_tax OR
+                      shopify_sync_orders.total_discounts IS DISTINCT FROM EXCLUDED.total_discounts OR
+                      shopify_sync_orders.total_shipping IS DISTINCT FROM EXCLUDED.total_shipping OR
+                      shopify_sync_orders.billing_address IS DISTINCT FROM EXCLUDED.billing_address OR
+                      shopify_sync_orders.shipping_address IS DISTINCT FROM EXCLUDED.shipping_address OR
+                      shopify_sync_orders.line_items IS DISTINCT FROM EXCLUDED.line_items OR
+                      shopify_sync_orders.shipping_lines IS DISTINCT FROM EXCLUDED.shipping_lines OR
+                      shopify_sync_orders.discount_applications IS DISTINCT FROM EXCLUDED.discount_applications OR
+                      shopify_sync_orders.note IS DISTINCT FROM EXCLUDED.note OR
+                      shopify_sync_orders.tags IS DISTINCT FROM EXCLUDED.tags OR
+                      shopify_sync_orders.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+					  shopify_sync_orders.sync_date != EXCLUDED.sync_date
                     )
 			`,
 				orderID, name, orderNumber, customerID, email, phone,
@@ -1076,21 +1121,20 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	query := `
 		query GetCollections($cursor: String) {
-			collections(first: 50, after: $cursor) {
+			collections(first: 20, after: $cursor) { // Reduced from 50 to 20
 				pageInfo { hasNextPage endCursor }
 				edges {
 					node {
-						id title handle description descriptionHtml # Added descriptionHtml
+						id title handle description descriptionHtml
 						sortOrder productsCount
-						products(first: 250) { # Fetch product IDs if needed
+						products(first: 100) { // Reduced from 250 to 100
 							edges { node { id } }
 						}
-						ruleSet { # Fetched ruleSet
+						ruleSet {
 							rules { column relation condition }
 							appliedDisjunctively
 						}
 						updatedAt publishedAt templateSuffix
-						# createdAt is not directly available on Collection node
 					}
 				}
 			}
@@ -1151,7 +1195,6 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 			productsCount := safeGetInt(node, "productsCount")
 			publishedAt := safeGetTimestamp(node, "publishedAt")
 			updatedAt := safeGetTimestamp(node, "updatedAt")
-			// createdAt := safeGetTimestamp(node, "createdAt") // Not available
 
 			// Convert complex fields to JSON
 			productsJSON := safeGetJSONB(node, "products")
@@ -1159,7 +1202,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 
 			// Use UPSERT
 			_, err = tx.Exec(ctx, `
-				INSERT INTO shopify_collections (
+				INSERT INTO shopify_sync_collections (
 					collection_id, title, handle, description, description_html, products_count,
 					products, rule_set, sort_order, published_at, template_suffix,
 					updated_at, sync_date
@@ -1169,18 +1212,18 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 					products = EXCLUDED.products, rule_set = EXCLUDED.rule_set, sort_order = EXCLUDED.sort_order, published_at = EXCLUDED.published_at, template_suffix = EXCLUDED.template_suffix,
 					updated_at = EXCLUDED.updated_at, sync_date = EXCLUDED.sync_date
                 WHERE
-                    ( shopify_collections.title IS DISTINCT FROM EXCLUDED.title OR
-                      shopify_collections.handle IS DISTINCT FROM EXCLUDED.handle OR
-                      shopify_collections.description IS DISTINCT FROM EXCLUDED.description OR
-                      shopify_collections.description_html IS DISTINCT FROM EXCLUDED.description_html OR
-                      shopify_collections.products_count IS DISTINCT FROM EXCLUDED.products_count OR
-                      shopify_collections.products IS DISTINCT FROM EXCLUDED.products OR
-                      shopify_collections.rule_set IS DISTINCT FROM EXCLUDED.rule_set OR
-                      shopify_collections.sort_order IS DISTINCT FROM EXCLUDED.sort_order OR
-                      shopify_collections.published_at IS DISTINCT FROM EXCLUDED.published_at OR
-                      shopify_collections.template_suffix IS DISTINCT FROM EXCLUDED.template_suffix OR
-                      shopify_collections.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
-					  shopify_collections.sync_date != EXCLUDED.sync_date
+                    ( shopify_sync_collections.title IS DISTINCT FROM EXCLUDED.title OR
+                      shopify_sync_collections.handle IS DISTINCT FROM EXCLUDED.handle OR
+                      shopify_sync_collections.description IS DISTINCT FROM EXCLUDED.description OR
+                      shopify_sync_collections.description_html IS DISTINCT FROM EXCLUDED.description_html OR
+                      shopify_sync_collections.products_count IS DISTINCT FROM EXCLUDED.products_count OR
+                      shopify_sync_collections.products IS DISTINCT FROM EXCLUDED.products OR
+                      shopify_sync_collections.rule_set IS DISTINCT FROM EXCLUDED.rule_set OR
+                      shopify_sync_collections.sort_order IS DISTINCT FROM EXCLUDED.sort_order OR
+                      shopify_sync_collections.published_at IS DISTINCT FROM EXCLUDED.published_at OR
+                      shopify_sync_collections.template_suffix IS DISTINCT FROM EXCLUDED.template_suffix OR
+                      shopify_sync_collections.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+					  shopify_sync_collections.sync_date != EXCLUDED.sync_date
                     )
 			`,
 				collectionID, title, handle, description, descriptionHtml, productsCount,
@@ -1228,11 +1271,11 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 	// Query to get all blogs (pagination usually not needed unless there are hundreds)
 	blogsQuery := `
 		query GetBlogs {
-			blogs(first: 100) { # Adjust count if more blogs exist
+			blogs(first: 50) { // Reduced from 100 to 50
 				edges {
 					node { id title handle }
 				}
-				pageInfo { hasNextPage } # Check if pagination needed
+				pageInfo { hasNextPage }
 			}
 		}
 	`
@@ -1242,18 +1285,18 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 		query GetBlogArticles($blogId: ID!, $cursor: String) {
 			node(id: $blogId) {
 				... on Blog {
-					articles(first: 50, after: $cursor) {
+					articles(first: 20, after: $cursor) { // Reduced from 50 to 20
 						pageInfo { hasNextPage endCursor }
 						edges {
 							node {
 								id title
-								authorV2 { name bio email } # Note: author field is deprecated
+								authorV2 { name bio email }
 								content contentHtml excerpt handle
 								image { id url altText width height }
-								tags # is array
+								tags
 								seo { title description }
 								publishedAt status createdAt updatedAt
-								commentsCount # Might need permission
+								commentsCount
 								summaryHtml templateSuffix
 							}
 						}
@@ -1392,7 +1435,7 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 
 				// Use UPSERT
 				_, err = tx.Exec(ctx, `
-					INSERT INTO shopify_blog_articles (
+					INSERT INTO shopify_sync_blog_articles (
 						blog_id, article_id, blog_title, title, author,
 						content, content_html, excerpt, handle, image, tags, seo,
 						status, published_at, created_at, updated_at,
@@ -1408,23 +1451,23 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 						created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at, comments_count = EXCLUDED.comments_count,
 						summary_html = EXCLUDED.summary_html, template_suffix = EXCLUDED.template_suffix, sync_date = EXCLUDED.sync_date
                     WHERE
-                        ( shopify_blog_articles.blog_title IS DISTINCT FROM EXCLUDED.blog_title OR
-                          shopify_blog_articles.title IS DISTINCT FROM EXCLUDED.title OR
-                          shopify_blog_articles.author IS DISTINCT FROM EXCLUDED.author OR
-                          shopify_blog_articles.content IS DISTINCT FROM EXCLUDED.content OR
-                          shopify_blog_articles.content_html IS DISTINCT FROM EXCLUDED.content_html OR
-                          shopify_blog_articles.excerpt IS DISTINCT FROM EXCLUDED.excerpt OR
-                          shopify_blog_articles.handle IS DISTINCT FROM EXCLUDED.handle OR
-                          shopify_blog_articles.image IS DISTINCT FROM EXCLUDED.image OR
-                          shopify_blog_articles.tags IS DISTINCT FROM EXCLUDED.tags OR
-                          shopify_blog_articles.seo IS DISTINCT FROM EXCLUDED.seo OR
-                          shopify_blog_articles.status IS DISTINCT FROM EXCLUDED.status OR
-                          shopify_blog_articles.published_at IS DISTINCT FROM EXCLUDED.published_at OR
-                          shopify_blog_articles.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
-                          shopify_blog_articles.comments_count IS DISTINCT FROM EXCLUDED.comments_count OR
-                          shopify_blog_articles.summary_html IS DISTINCT FROM EXCLUDED.summary_html OR
-                          shopify_blog_articles.template_suffix IS DISTINCT FROM EXCLUDED.template_suffix OR
-                          shopify_blog_articles.sync_date != EXCLUDED.sync_date
+                        ( shopify_sync_blog_articles.blog_title IS DISTINCT FROM EXCLUDED.blog_title OR
+                          shopify_sync_blog_articles.title IS DISTINCT FROM EXCLUDED.title OR
+                          shopify_sync_blog_articles.author IS DISTINCT FROM EXCLUDED.author OR
+                          shopify_sync_blog_articles.content IS DISTINCT FROM EXCLUDED.content OR
+                          shopify_sync_blog_articles.content_html IS DISTINCT FROM EXCLUDED.content_html OR
+                          shopify_sync_blog_articles.excerpt IS DISTINCT FROM EXCLUDED.excerpt OR
+                          shopify_sync_blog_articles.handle IS DISTINCT FROM EXCLUDED.handle OR
+                          shopify_sync_blog_articles.image IS DISTINCT FROM EXCLUDED.image OR
+                          shopify_sync_blog_articles.tags IS DISTINCT FROM EXCLUDED.tags OR
+                          shopify_sync_blog_articles.seo IS DISTINCT FROM EXCLUDED.seo OR
+                          shopify_sync_blog_articles.status IS DISTINCT FROM EXCLUDED.status OR
+                          shopify_sync_blog_articles.published_at IS DISTINCT FROM EXCLUDED.published_at OR
+                          shopify_sync_blog_articles.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+                          shopify_sync_blog_articles.comments_count IS DISTINCT FROM EXCLUDED.comments_count OR
+                          shopify_sync_blog_articles.summary_html IS DISTINCT FROM EXCLUDED.summary_html OR
+                          shopify_sync_blog_articles.template_suffix IS DISTINCT FROM EXCLUDED.template_suffix OR
+                          shopify_sync_blog_articles.sync_date != EXCLUDED.sync_date
                         )
 				`,
 					blogID, articleID, blogTitle, title, authorName,

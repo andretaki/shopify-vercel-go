@@ -1,4 +1,4 @@
-# Binaries for programs and plugins
+# Go
 *.exe
 *.exe~
 *.dll
@@ -6,26 +6,24 @@
 *.dylib
 *.test
 *.out
+/vendor/
+/go.mod
+/go.sum
 
-# Go workspace file
-go.work
-
-# Environment variables
+# Vercel
+.vercel
 .env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
-# Vercel
-.vercel
-
-# IDE specific files
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# OS specific files
+# OS
 .DS_Store
 Thumbs.db

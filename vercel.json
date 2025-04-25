@@ -8,7 +8,7 @@
   ],
   "routes": [
     {
-      "src": "/(.*)",
+      "src": "/api/(.*)",
       "dest": "/api/$1"
     }
   ],
@@ -17,14 +17,5 @@
       "path": "/api/shopify-export?type=all",
       "schedule": "0 0 * * *"
     }
-  ],
-  "env": {
-    "SHOPIFY_STORE": "alliance-chemical-store.myshopify.com",
-    "SHOPIFY_ACCESS_TOKEN": "@shopify_access_token",
-    "SHOPIFY_API_KEY": "@shopify_api_key",
-    "SHOPIFY_API_SECRET": "@shopify_api_secret",
-    "SHIPSTATION_API_KEY": "@shipstation_api_key",
-    "SHIPSTATION_API_SECRET": "@shipstation_api_secret",
-    "DATABASE_URL": "@database_url"
-  }
+  ]
 }
