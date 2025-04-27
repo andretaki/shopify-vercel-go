@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v4"
 )
 
 // ShopifyGraphQLClient handles communication with the Shopify GraphQL API
@@ -240,5 +243,125 @@ func DatabaseHandler(w http.ResponseWriter, r *http.Request) {
 
 // Handler function for Vercel serverless deployment - this acts as a router
 func Handler(w http.ResponseWriter, r *http.Request) {
-	DatabaseHandler(w, r)
+	// Set content type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Get sync type from query parameter or default to "all"
+	syncType := r.URL.Query().Get("type")
+	if syncType == "" {
+		syncType = "all"
+	}
+
+	// Get today's date for logging
+	today := time.Now().Format("2006-01-02")
+
+	// Initialize database
+	ctx := context.Background()
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("DATABASE_URL environment variable not set"))
+		return
+	}
+
+	// Connect to the database
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to connect to database: %v", err))
+		return
+	}
+	defer conn.Close(ctx)
+
+	// Initialize database tables
+	if err := initDatabaseTables(ctx, conn); err != nil {
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize database tables: %v", err))
+		return
+	}
+
+	// Stats to track what was imported
+	stats := make(map[string]int)
+	var syncErrors []SyncError
+
+	// Execute requested sync operations
+	if syncType == "all" || syncType == "products" {
+		productCount, err := syncProducts(ctx, conn, today)
+		if err != nil {
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "products",
+				Message: fmt.Sprintf("Failed to sync products: %v", err),
+				Details: err.Error(),
+			})
+		} else {
+			stats["products"] = productCount
+		}
+	}
+
+	if syncType == "all" || syncType == "customers" {
+		customerCount, err := syncCustomers(ctx, conn, today)
+		if err != nil {
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "customers",
+				Message: fmt.Sprintf("Failed to sync customers: %v", err),
+				Details: err.Error(),
+			})
+		} else {
+			stats["customers"] = customerCount
+		}
+	}
+
+	if syncType == "all" || syncType == "orders" {
+		orderCount, err := syncOrders(ctx, conn, today)
+		if err != nil {
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "orders",
+				Message: fmt.Sprintf("Failed to sync orders: %v", err),
+				Details: err.Error(),
+			})
+		} else {
+			stats["orders"] = orderCount
+		}
+	}
+
+	if syncType == "all" || syncType == "collections" {
+		collectionCount, err := syncCollections(ctx, conn, today)
+		if err != nil {
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "collections",
+				Message: fmt.Sprintf("Failed to sync collections: %v", err),
+				Details: err.Error(),
+			})
+		} else {
+			stats["collections"] = collectionCount
+		}
+	}
+
+	if syncType == "all" || syncType == "blogs" {
+		blogCount, err := syncBlogArticles(ctx, conn, today)
+		if err != nil {
+			syncErrors = append(syncErrors, SyncError{
+				Type:    "blogs",
+				Message: fmt.Sprintf("Failed to sync blog articles: %v", err),
+				Details: err.Error(),
+			})
+		} else {
+			stats["blog_articles"] = blogCount
+		}
+	}
+
+	// Prepare response
+	response := Response{
+		Success: len(syncErrors) == 0,
+		Stats:   stats,
+		Errors:  syncErrors,
+	}
+
+	if len(syncErrors) > 0 {
+		response.Message = fmt.Sprintf("Completed Shopify export on %s with %d errors.", today, len(syncErrors))
+		w.WriteHeader(http.StatusInternalServerError)
+	} else {
+		response.Message = fmt.Sprintf("Successfully exported Shopify data on %s", today)
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// Return response
+	json.NewEncoder(w).Encode(response)
 }
