@@ -1,144 +1,213 @@
 package api
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
-
-	"github.com/jackc/pgx/v4"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
-// initDatabaseTables creates or updates the necessary database tables
-func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
-	// Create tables for each entity type
-	tables := []string{
-		`CREATE TABLE IF NOT EXISTS products (
-			id BIGSERIAL PRIMARY KEY,
-			shopify_id BIGINT UNIQUE NOT NULL,
-			title TEXT NOT NULL,
-			description TEXT,
-			vendor TEXT,
-			product_type TEXT,
-			handle TEXT UNIQUE,
-			status TEXT,
-			tags TEXT[],
-			variants JSONB,
-			images JSONB,
-			options JSONB,
-			created_at TIMESTAMP WITH TIME ZONE,
-			updated_at TIMESTAMP WITH TIME ZONE,
-			last_synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-		)`,
+// ShopifyGraphQLClient handles communication with the Shopify GraphQL API
+type ShopifyGraphQLClient struct {
+	StoreURL    string
+	AccessToken string
+	Client      *http.Client
+}
 
-		`CREATE TABLE IF NOT EXISTS customers (
-			id BIGSERIAL PRIMARY KEY,
-			shopify_id BIGINT UNIQUE NOT NULL,
-			email TEXT UNIQUE,
-			first_name TEXT,
-			last_name TEXT,
-			phone TEXT,
-			orders_count INTEGER,
-			total_spent DECIMAL(10,2),
-			note TEXT,
-			tags TEXT[],
-			addresses JSONB,
-			created_at TIMESTAMP WITH TIME ZONE,
-			updated_at TIMESTAMP WITH TIME ZONE,
-			last_synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-		)`,
+// NewShopifyGraphQLClient creates a new Shopify GraphQL API client
+func NewShopifyGraphQLClient() (*ShopifyGraphQLClient, error) {
+	shopifyStore := os.Getenv("SHOPIFY_STORE")
+	accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN")
 
-		`CREATE TABLE IF NOT EXISTS orders (
-			id BIGSERIAL PRIMARY KEY,
-			shopify_id BIGINT UNIQUE NOT NULL,
-			order_number TEXT UNIQUE NOT NULL,
-			customer_id BIGINT REFERENCES customers(shopify_id),
-			email TEXT,
-			financial_status TEXT,
-			fulfillment_status TEXT,
-			total_price DECIMAL(10,2),
-			subtotal_price DECIMAL(10,2),
-			total_tax DECIMAL(10,2),
-			currency TEXT,
-			line_items JSONB,
-			shipping_address JSONB,
-			billing_address JSONB,
-			created_at TIMESTAMP WITH TIME ZONE,
-			updated_at TIMESTAMP WITH TIME ZONE,
-			last_synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS collections (
-			id BIGSERIAL PRIMARY KEY,
-			shopify_id BIGINT UNIQUE NOT NULL,
-			title TEXT NOT NULL,
-			handle TEXT UNIQUE,
-			description TEXT,
-			image JSONB,
-			products_count INTEGER,
-			rule_set JSONB,
-			created_at TIMESTAMP WITH TIME ZONE,
-			updated_at TIMESTAMP WITH TIME ZONE,
-			last_synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS blog_articles (
-			id BIGSERIAL PRIMARY KEY,
-			shopify_id BIGINT UNIQUE NOT NULL,
-			title TEXT NOT NULL,
-			handle TEXT,
-			author TEXT,
-			content TEXT,
-			excerpt TEXT,
-			image JSONB,
-			tags TEXT[],
-			blog_id BIGINT,
-			created_at TIMESTAMP WITH TIME ZONE,
-			updated_at TIMESTAMP WITH TIME ZONE,
-			last_synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-		)`,
+	if shopifyStore == "" || accessToken == "" {
+		return nil, fmt.Errorf("missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN environment variable")
 	}
 
-	// Execute each table creation query
-	for _, query := range tables {
-		_, err := conn.Exec(ctx, query)
-		if err != nil {
-			return fmt.Errorf("failed to create table: %v", err)
+	return &ShopifyGraphQLClient{
+		StoreURL:    shopifyStore,
+		AccessToken: accessToken,
+		Client:      &http.Client{Timeout: 30 * time.Second},
+	}, nil
+}
+
+// ExecuteQuery executes a GraphQL query against the Shopify API
+func (c *ShopifyGraphQLClient) ExecuteQuery(query string, variables map[string]interface{}) (map[string]interface{}, error) {
+	url := fmt.Sprintf("https://%s/admin/api/2023-07/graphql.json", c.StoreURL)
+
+	requestBody, err := json.Marshal(GraphQLRequest{
+		Query:     query,
+		Variables: variables,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal GraphQL request: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Shopify-Access-Token", c.AccessToken)
+
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute GraphQL request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Shopify API returned non-200 status code: %d, body: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var graphqlResp GraphQLResponse
+	if err := json.Unmarshal(bodyBytes, &graphqlResp); err != nil {
+		return nil, fmt.Errorf("failed to parse GraphQL response: %v", err)
+	}
+
+	if len(graphqlResp.Errors) > 0 {
+		var errMsgs []string
+		for _, e := range graphqlResp.Errors {
+			errMsgs = append(errMsgs, e.Message)
+		}
+		return nil, fmt.Errorf("GraphQL errors: %s", strings.Join(errMsgs, "; "))
+	}
+
+	return graphqlResp.Data, nil
+}
+
+// ExtractIDFromGID extracts the numeric ID from a Shopify GID (Global ID)
+// Example: "gid://shopify/Product/12345" -> 12345
+func ExtractIDFromGID(gid string) (int64, error) {
+	parts := strings.Split(gid, "/")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid GID format: %s", gid)
+	}
+
+	idStr := parts[len(parts)-1]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse ID from GID: %v", err)
+	}
+
+	return id, nil
+}
+
+// SafeGetString safely extracts a string value from a map
+func SafeGetString(data map[string]interface{}, key string) string {
+	if val, ok := data[key]; ok && val != nil {
+		if str, ok := val.(string); ok {
+			return str
 		}
 	}
+	return ""
+}
 
+// SafeGetInt safely extracts an int value from a map
+func SafeGetInt(data map[string]interface{}, key string) int {
+	if val, ok := data[key]; ok && val != nil {
+		switch v := val.(type) {
+		case int:
+			return v
+		case int64:
+			return int(v)
+		case float64:
+			return int(v)
+		case string:
+			i, err := strconv.Atoi(v)
+			if err == nil {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+// SafeGetFloat safely extracts a float64 value from a map
+func SafeGetFloat(data map[string]interface{}, key string) float64 {
+	if val, ok := data[key]; ok && val != nil {
+		switch v := val.(type) {
+		case float64:
+			return v
+		case int:
+			return float64(v)
+		case int64:
+			return float64(v)
+		case string:
+			f, err := strconv.ParseFloat(v, 64)
+			if err == nil {
+				return f
+			}
+		}
+	}
+	return 0.0
+}
+
+// SafeGetBool safely extracts a bool value from a map
+func SafeGetBool(data map[string]interface{}, key string) bool {
+	if val, ok := data[key]; ok && val != nil {
+		if b, ok := val.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+// SafeGetTime safely extracts a time.Time value from a map
+func SafeGetTime(data map[string]interface{}, key string) *time.Time {
+	if val, ok := data[key]; ok && val != nil {
+		if str, ok := val.(string); ok && str != "" {
+			t, err := time.Parse(time.RFC3339, str)
+			if err == nil {
+				return &t
+			}
+		}
+	}
 	return nil
 }
 
-// syncProducts fetches and syncs products from Shopify to the database
-func syncProducts(_ context.Context, _ *pgx.Conn, _ string) (int, error) {
-	// TODO: Implement Shopify API call to fetch products
-	// TODO: Implement database sync logic
-	return 0, nil
+// SafeGetStringArray safely extracts a string array from a map
+func SafeGetStringArray(data map[string]interface{}, key string) []string {
+	if val, ok := data[key]; ok && val != nil {
+		if arr, ok := val.([]interface{}); ok {
+			result := make([]string, 0, len(arr))
+			for _, item := range arr {
+				if str, ok := item.(string); ok {
+					result = append(result, str)
+				}
+			}
+			return result
+		}
+	}
+	return []string{}
 }
 
-// syncCustomers fetches and syncs customers from Shopify to the database
-func syncCustomers(_ context.Context, _ *pgx.Conn, _ string) (int, error) {
-	// TODO: Implement Shopify API call to fetch customers
-	// TODO: Implement database sync logic
-	return 0, nil
+// SafeGetMap safely extracts a map from a map
+func SafeGetMap(data map[string]interface{}, key string) map[string]interface{} {
+	if val, ok := data[key]; ok && val != nil {
+		if m, ok := val.(map[string]interface{}); ok {
+			return m
+		}
+	}
+	return map[string]interface{}{}
 }
 
-// syncOrders fetches and syncs orders from Shopify to the database
-func syncOrders(_ context.Context, _ *pgx.Conn, _ string) (int, error) {
-	// TODO: Implement Shopify API call to fetch orders
-	// TODO: Implement database sync logic
-	return 0, nil
-}
-
-// syncCollections fetches and syncs collections from Shopify to the database
-func syncCollections(_ context.Context, _ *pgx.Conn, _ string) (int, error) {
-	// TODO: Implement Shopify API call to fetch collections
-	// TODO: Implement database sync logic
-	return 0, nil
-}
-
-// syncBlogArticles fetches and syncs blog articles from Shopify to the database
-func syncBlogArticles(_ context.Context, _ *pgx.Conn, _ string) (int, error) {
-	// TODO: Implement Shopify API call to fetch blog articles
-	// TODO: Implement database sync logic
-	return 0, nil
+// SafeGetArray safely extracts an array from a map
+func SafeGetArray(data map[string]interface{}, key string) []interface{} {
+	if val, ok := data[key]; ok && val != nil {
+		if arr, ok := val.([]interface{}); ok {
+			return arr
+		}
+	}
+	return []interface{}{}
 }

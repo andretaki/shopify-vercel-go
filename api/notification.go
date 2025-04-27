@@ -2,10 +2,11 @@
 package api
 
 import (
-	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -122,22 +123,14 @@ func SendMailgunNotification(payload NotificationPayload) error {
 	mailgunURL := fmt.Sprintf("https://api.mailgun.net/v3/%s/messages", mailgunDomain)
 
 	// Prepare form data for API request
-	formData := map[string]string{
-		"from":    fromEmail,
-		"to":      toEmail,
-		"subject": subject,
-		"html":    emailContent,
-	}
+	formData := url.Values{}
+	formData.Set("from", fromEmail)
+	formData.Set("to", toEmail)
+	formData.Set("subject", subject)
+	formData.Set("html", emailContent)
 
-	// Convert form data to URL-encoded format
-	formValues := make([]string, 0, len(formData))
-	for key, value := range formData {
-		formValues = append(formValues, fmt.Sprintf("%s=%s", key, value))
-	}
-	formDataStr := strings.Join(formValues, "&")
-
-	// Create HTTP request with proper authentication
-	req, err := http.NewRequest("POST", mailgunURL, bytes.NewBufferString(formDataStr))
+	// Create HTTP request with proper encoding
+	req, err := http.NewRequest("POST", mailgunURL, strings.NewReader(formData.Encode()))
 	if err != nil {
 		return fmt.Errorf("failed to create email request: %v", err)
 	}
@@ -153,9 +146,10 @@ func SendMailgunNotification(payload NotificationPayload) error {
 	}
 	defer resp.Body.Close()
 
-	// Handle error responses
+	// Improve error handling
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("Mailgun API returned error status: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mailgun API returned error status: %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	return nil
