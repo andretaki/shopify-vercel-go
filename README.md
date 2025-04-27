@@ -5,7 +5,7 @@ A robust Go-based API for exporting data from e-commerce platforms (Shopify and 
 ## Features
 
 - **Comprehensive Data Export**: Sync multiple data sources:
-  - **Shopify**:
+  - **Shopify** (API Version: 2024-07):
     - Products (with variants, images, and metafields)
     - Customers (with addresses and order history)
     - Orders (with line items, shipping, and discounts)
@@ -101,13 +101,13 @@ GET /api/shopify-export?type=<entity_type>
 ### ShipStation Export
 
 ```
-GET /api/shipstation-export
+GET /api/shipstation-export"
 ```
 
 Fetches and stores ShipStation order data.
 
 ```
-GET /api/shipstation-data
+GET /api/shipstation-data"
 ```
 
 Fetches and stores additional ShipStation data (shipments, carriers, warehouses, stores).
