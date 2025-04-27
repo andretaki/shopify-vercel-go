@@ -8,6 +8,14 @@
   ],
   "routes": [
     {
+      "src": "/api/database",
+      "dest": "/api/database.go"
+    },
+    {
+      "src": "/api/shopify-export",
+      "dest": "/api/shopify-export.go"
+    },
+    {
       "src": "/api/(.*)",
       "dest": "/api/$1",
       "headers": {

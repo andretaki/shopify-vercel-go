@@ -67,7 +67,7 @@ func (c *ShopifyGraphQLClient) ExecuteQuery(query string, variables map[string]i
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Shopify API returned non-200 status code: %d, body: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("shopify API returned non-200 status code: %d, body: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var graphqlResp GraphQLResponse
@@ -210,4 +210,35 @@ func SafeGetArray(data map[string]interface{}, key string) []interface{} {
 		}
 	}
 	return []interface{}{}
+}
+
+// DatabaseHandler is the Vercel serverless function handler for database operations
+func DatabaseHandler(w http.ResponseWriter, r *http.Request) {
+	client, err := NewShopifyGraphQLClient()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error creating Shopify client: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Example query - replace with your actual implementation
+	query := `{
+		shop {
+			name
+			email
+		}
+	}`
+
+	result, err := client.ExecuteQuery(query, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error executing GraphQL query: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// Handler function for Vercel serverless deployment - this acts as a router
+func Handler(w http.ResponseWriter, r *http.Request) {
+	DatabaseHandler(w, r)
 }

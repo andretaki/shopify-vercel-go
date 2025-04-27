@@ -52,8 +52,8 @@ type SyncError struct {
 	Details string `json:"details,omitempty"` // Additional error details if available
 }
 
-// Handler is the entrypoint for the Vercel serverless function
-func Handler(w http.ResponseWriter, r *http.Request) {
+// ExportHandler is the entrypoint for the Vercel serverless function
+func ExportHandler(w http.ResponseWriter, r *http.Request) {
 	// Set content type
 	w.Header().Set("Content-Type", "application/json")
 
