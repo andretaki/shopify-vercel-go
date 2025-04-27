@@ -15,6 +15,14 @@
       "dest": "/api/shopify-export.go"
     },
     {
+      "src": "/api/shipstation-export",
+      "dest": "/api/shipstation-export.go?handler=ShipStationHandler"
+    },
+    {
+      "src": "/api/shipstation-data",
+      "dest": "/api/shipstation-export.go?handler=ShipStationDataHandler"
+    },
+    {
       "src": "/api/notification-test",
       "dest": "/api/notification.go?handler=NotificationHandler"
     },
@@ -32,6 +40,14 @@
     {
       "path": "/api/shopify-export?type=all",
       "schedule": "0 */2 * * *"
+    },
+    {
+      "path": "/api/shipstation-export",
+      "schedule": "0 */6 * * *"
+    },
+    {
+      "path": "/api/shipstation-data",
+      "schedule": "0 */12 * * *"
     }
   ]
 }

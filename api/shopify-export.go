@@ -404,7 +404,7 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	graphqlURL := fmt.Sprintf("https://%s/admin/api/2024-10/graphql.json", shopName)
+	graphqlURL := fmt.Sprintf("https://%s/admin/api/2024-07/graphql.json", shopName)
 
 	requestBody := GraphQLRequest{
 		Query:     query,
