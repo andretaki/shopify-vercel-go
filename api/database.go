@@ -241,7 +241,7 @@ func DatabaseHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-// Handler function for Vercel serverless deployment - this acts as a router
+// Handler is the entrypoint for the Vercel serverless function
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// Set content type
 	w.Header().Set("Content-Type", "application/json")
