@@ -2,6 +2,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -34,6 +35,14 @@ type NotificationPayload struct {
 	Timestamp string           `json:"timestamp"`
 	Source    string           `json:"source"`
 	Duration  string           `json:"duration,omitempty"`
+}
+
+// NotificationResponse is the API response structure
+type NotificationResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Type    string `json:"type,omitempty"`
+	Time    string `json:"time,omitempty"`
 }
 
 // SendMailgunNotification delivers notification content via Mailgun's API
@@ -176,7 +185,7 @@ func SendNotification(notificationType NotificationType, message string, details
 	log.Printf("%s %s: %s\n", logPrefix, message, details)
 
 	// Attempt to send email notification
-	err := SendMailgunNotification(payload)
+	err := SendMailgunNotification(payload) // Store potential error from Mailgun
 	if err != nil {
 		// Log error but don't fail the process
 		log.Printf("Failed to send email notification: %v\n", err)
@@ -205,4 +214,67 @@ func SendSuccessNotification(message string, details string, duration ...string)
 // SendInfoNotification sends an informational notification
 func SendInfoNotification(message string, details string, duration ...string) error {
 	return SendNotification(InfoNotification, message, details, duration...)
+}
+
+// NotificationHandler is the entrypoint for the Vercel serverless function
+func NotificationHandler(w http.ResponseWriter, r *http.Request) {
+	// Set content type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Extract notification type from query parameter or default to "info"
+	notificationType := r.URL.Query().Get("type")
+	if notificationType == "" {
+		notificationType = "info"
+	}
+
+	var typedNotification NotificationType
+
+	// Map string parameter to NotificationType
+	switch notificationType {
+	case "error":
+		typedNotification = ErrorNotification
+	case "warning":
+		typedNotification = WarningNotification
+	case "success":
+		typedNotification = SuccessNotification
+	default:
+		typedNotification = InfoNotification
+		notificationType = "info" // normalize for response
+	}
+
+	// Generate timestamp for both notification and response
+	timestamp := time.Now().Format(time.RFC3339)
+
+	// Send a test notification
+	testMessage := "Notification API Request"
+	testDetails := fmt.Sprintf("This is a %s notification sent at %s.\n\nThis message confirms that the notification system is working correctly.\n\nYou can use this endpoint to test different notification types by adding ?type=error, ?type=warning, ?type=success, or ?type=info to the URL.",
+		notificationType,
+		timestamp)
+
+	err := SendNotification(
+		typedNotification,
+		testMessage,
+		testDetails,
+	)
+
+	if err != nil {
+		// Handle notification failure
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(NotificationResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to send test notification: %v", err),
+			Type:    notificationType,
+			Time:    timestamp,
+		})
+		return
+	}
+
+	// Return success response
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(NotificationResponse{
+		Success: true,
+		Message: fmt.Sprintf("Test %s notification sent successfully!", notificationType),
+		Type:    notificationType,
+		Time:    timestamp,
+	})
 }

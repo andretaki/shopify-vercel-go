@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"strconv" // Import strconv for string to float conversion
@@ -52,8 +53,8 @@ type SyncError struct {
 	Details string `json:"details,omitempty"` // Additional error details if available
 }
 
-// ExportHandler is the entrypoint for the Vercel serverless function
-func ExportHandler(w http.ResponseWriter, r *http.Request) {
+// Handler is the entrypoint for the Vercel serverless function
+func Handler(w http.ResponseWriter, r *http.Request) {
 	// Set content type
 	w.Header().Set("Content-Type", "application/json")
 
@@ -66,27 +67,48 @@ func ExportHandler(w http.ResponseWriter, r *http.Request) {
 	// Get today's date for logging
 	today := time.Now().Format("2006-01-02")
 
+	// Log the start of the export
+	fmt.Printf("Starting Shopify export at %s for type: %s\n", time.Now().Format(time.RFC3339), syncType)
+
 	// Initialize database
 	ctx := context.Background()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("DATABASE_URL environment variable not set"))
+		err := fmt.Errorf("DATABASE_URL environment variable not set")
+		fmt.Printf("Error: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// Check Shopify environment variables
+	shopifyStore := os.Getenv("SHOPIFY_STORE")
+	accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN")
+	if shopifyStore == "" || accessToken == "" {
+		err := fmt.Errorf("missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN environment variables")
+		fmt.Printf("Error: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	// Connect to the database
+	fmt.Println("Connecting to database...")
 	conn, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
+		fmt.Printf("Database connection error: %v\n", err)
 		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to connect to database: %v", err))
 		return
 	}
 	defer conn.Close(ctx)
+	fmt.Println("Database connection successful")
 
 	// Initialize database tables
+	fmt.Println("Initializing database tables...")
 	if err := initDatabaseTables(ctx, conn); err != nil {
+		fmt.Printf("Database initialization error: %v\n", err)
 		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize database tables: %v", err))
 		return
 	}
+	fmt.Println("Database tables initialized successfully")
 
 	// Stats to track what was imported
 	stats := make(map[string]int)
@@ -382,7 +404,7 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	graphqlURL := fmt.Sprintf("https://%s/admin/api/2024-04/graphql.json", shopName)
+	graphqlURL := fmt.Sprintf("https://%s/admin/api/2024-10/graphql.json", shopName)
 
 	requestBody := GraphQLRequest{
 		Query:     query,
@@ -566,8 +588,7 @@ func safeGetJSONB(data map[string]interface{}, key string) []byte {
 }
 
 func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
-	// Reduced page size for better rate limit handling
-	pageSize := 20 // Reduced from 50 to 20
+	pageSize := 20
 	query := fmt.Sprintf(`
 		query GetProducts($cursor: String) {
 			products(first: %d, after: $cursor) {
@@ -588,14 +609,14 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 						publishedAt
 						createdAt
 						updatedAt
-						variants(first: 100) {  // Reduced from 250 to 100
+						variants(first: 100) {
 							edges { node { id title price inventoryQuantity sku barcode weight weightUnit requiresShipping taxable } }
 						}
-						images(first: 100) {     // Reduced from 250 to 100
+						images(first: 100) {
 							edges { node { id src altText width height } }
 						}
 						options { id name values }
-						metafields(first: 100) { // Reduced from 250 to 100
+						metafields(first: 100) {
 							edges { node { id namespace key value type } }
 						}
 					}
@@ -606,12 +627,13 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		log.Printf("❌ Failed to begin transaction: %v\n", err)
 		return 0, fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	defer tx.Rollback(ctx) // Rollback if commit fails or function returns early
+	defer tx.Rollback(ctx)
 
 	productCount := 0
-	var cursor *string // Pointer to handle optional cursor
+	var cursor *string
 
 	for {
 		variables := map[string]interface{}{}
@@ -621,7 +643,7 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
-			// No rollback here, let defer handle it
+			log.Printf("❌ GraphQL query failed: %v\n", err)
 			return 0, fmt.Errorf("graphql query failed: %w", err)
 		}
 
@@ -758,7 +780,7 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	query := `
 		query GetCustomers($cursor: String) {
-			customers(first: 20, after: $cursor) { // Reduced from 50 to 20
+			customers(first: 20, after: $cursor) {
 				pageInfo { hasNextPage endCursor }
 				edges {
 					node {
@@ -777,6 +799,7 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 	`
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		log.Printf("❌ Failed to begin transaction: %v\n", err)
 		return 0, fmt.Errorf("failed to begin transaction: %v", err)
 	}
 	defer tx.Rollback(ctx)
@@ -792,6 +815,7 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
+			log.Printf("❌ GraphQL query failed: %v\n", err)
 			return 0, fmt.Errorf("graphql query failed: %w", err)
 		}
 
@@ -925,7 +949,7 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	query := `
 		query GetOrders($cursor: String) {
-			orders(first: 10, after: $cursor) { // Reduced from 20 to 10
+			orders(first: 10, after: $cursor) {
 				pageInfo { hasNextPage endCursor }
 				edges {
 					node {
@@ -940,9 +964,9 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 						totalShippingPriceSet { shopMoney { amount currencyCode } }
 						billingAddress { address1 address2 city company country countryCode firstName lastName phone province provinceCode zip }
 						shippingAddress { address1 address2 city company country countryCode firstName lastName phone province provinceCode zip }
-						lineItems(first: 50) { edges { node { id title quantity variant { id sku barcode } originalTotalSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } } } } } // Reduced from 100 to 50
-						shippingLines(first: 5) { edges { node { id title carrierIdentifier originalPriceSet { shopMoney { amount } } discountedPriceSet { shopMoney { amount } } } } } // Reduced from 10 to 5
-						discountApplications(first: 5) { edges { node { __typename ... on DiscountApplication { value { ... on MoneyV2 { amount currencyCode } ... on PricingPercentageValue { percentage } } ... on AutomaticDiscountApplication { title } ... on ManualDiscountApplication { title description } ... on ScriptDiscountApplication { title } ... on DiscountCodeApplication { code applicable } } } } } // Reduced from 10 to 5
+						lineItems(first: 50) { edges { node { id title quantity variant { id sku barcode } originalTotalSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } } } } }
+						shippingLines(first: 5) { edges { node { id title carrierIdentifier originalPriceSet { shopMoney { amount } } discountedPriceSet { shopMoney { amount } } } } }
+						discountApplications(first: 5) { edges { node { __typename ... on DiscountApplication { value { ... on MoneyV2 { amount currencyCode } ... on PricingPercentageValue { percentage } } ... on AutomaticDiscountApplication { title } ... on ManualDiscountApplication { title description } ... on ScriptDiscountApplication { title } ... on DiscountCodeApplication { code applicable } } } } }
 						note tags createdAt updatedAt
 					}
 				}
@@ -952,6 +976,7 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		log.Printf("❌ Failed to begin transaction: %v\n", err)
 		return 0, fmt.Errorf("failed to begin transaction: %v", err)
 	}
 	defer tx.Rollback(ctx)
@@ -967,6 +992,7 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
+			log.Printf("❌ GraphQL query failed: %v\n", err)
 			return 0, fmt.Errorf("graphql query failed: %w", err)
 		}
 
@@ -1121,13 +1147,13 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	query := `
 		query GetCollections($cursor: String) {
-			collections(first: 20, after: $cursor) { // Reduced from 50 to 20
+			collections(first: 20, after: $cursor) {
 				pageInfo { hasNextPage endCursor }
 				edges {
 					node {
 						id title handle description descriptionHtml
 						sortOrder productsCount
-						products(first: 100) { // Reduced from 250 to 100
+						products(first: 100) {
 							edges { node { id } }
 						}
 						ruleSet {
@@ -1142,6 +1168,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 	`
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		log.Printf("❌ Failed to begin transaction: %v\n", err)
 		return 0, fmt.Errorf("failed to begin transaction: %v", err)
 	}
 	defer tx.Rollback(ctx)
@@ -1157,6 +1184,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
+			log.Printf("❌ GraphQL query failed: %v\n", err)
 			return 0, fmt.Errorf("graphql query failed: %w", err)
 		}
 
@@ -1271,7 +1299,7 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 	// Query to get all blogs (pagination usually not needed unless there are hundreds)
 	blogsQuery := `
 		query GetBlogs {
-			blogs(first: 50) { // Reduced from 100 to 50
+			blogs(first: 50) {
 				edges {
 					node { id title handle }
 				}
@@ -1285,7 +1313,7 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 		query GetBlogArticles($blogId: ID!, $cursor: String) {
 			node(id: $blogId) {
 				... on Blog {
-					articles(first: 20, after: $cursor) { // Reduced from 50 to 20
+					articles(first: 20, after: $cursor) {
 						pageInfo { hasNextPage endCursor }
 						edges {
 							node {
@@ -1308,6 +1336,7 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		log.Printf("❌ Failed to begin transaction: %v\n", err)
 		return 0, fmt.Errorf("failed to begin blog transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
@@ -1317,6 +1346,7 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 	// 1. Fetch all blogs
 	blogsData, err := executeGraphQLQuery(blogsQuery, nil)
 	if err != nil {
+		log.Printf("❌ Failed to fetch blogs: %v\n", err)
 		return 0, fmt.Errorf("failed to fetch blogs: %w", err)
 	}
 

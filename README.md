@@ -13,13 +13,18 @@ A robust Go-based API for exporting Shopify store data to a PostgreSQL database.
 
 - **Robust Error Handling**:
   - Detailed error reporting with type, message, and details
-  - Automatic retry mechanism with exponential backoff
-  - Rate limit detection and handling
+  - Automatic retry mechanism with exponential backoff for API calls
+  - Rate limit detection and handling during GraphQL queries
+  - **Email Notifications**: Sends success or failure summaries via Mailgun.
 
 - **Efficient Data Processing**:
   - Optimized page sizes to prevent rate limiting
   - Transaction-based updates for data consistency
   - Incremental updates to minimize database churn
+
+- **Monitoring**:
+  - Console logging for detailed process tracking.
+  - Email notifications summarize sync status, stats, errors, and duration.
 
 - **Flexible Sync Options**:
   - Selective sync by entity type
@@ -40,7 +45,11 @@ The following environment variables are required:
 ```bash
 DATABASE_URL=postgresql://user:password@host:port/database
 SHOPIFY_STORE=your-store.myshopify.com
+SHOPIFY_API_KEY=your-app-api-key # Optional but good practice
+SHOPIFY_API_SECRET=your-app-api-secret # Optional but good practice
 SHOPIFY_ACCESS_TOKEN=your-admin-api-access-token
+MAILGUN_DOMAIN=your-mailgun-sending-domain.com
+MAIL_API_KEY=your-mailgun-api-key
 ```
 
 ## API Endpoints
@@ -118,6 +127,8 @@ Errors are reported in a structured format:
   "details": "Technical error details"
 }
 ```
+
+Error summaries are also sent via email notification.
 
 Common error types:
 - `system`: Database or configuration errors

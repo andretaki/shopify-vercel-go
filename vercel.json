@@ -1,19 +1,22 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/*.go",
-      "use": "@vercel/go"
+  "functions": {
+    "api/*.go": {
+      "maxDuration": 60
     }
-  ],
+  },
   "routes": [
     {
       "src": "/api/database",
-      "dest": "/api/database.go"
+      "dest": "/api/database.go?handler=DatabaseHandler"
     },
     {
       "src": "/api/shopify-export",
       "dest": "/api/shopify-export.go"
+    },
+    {
+      "src": "/api/notification-test",
+      "dest": "/api/notification.go?handler=NotificationHandler"
     },
     {
       "src": "/api/(.*)",
@@ -28,7 +31,7 @@
   "crons": [
     {
       "path": "/api/shopify-export?type=all",
-      "schedule": "*/2 * * * *"
+      "schedule": "0 */2 * * *"
     }
   ]
 }
