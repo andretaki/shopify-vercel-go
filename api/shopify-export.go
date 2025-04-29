@@ -1456,11 +1456,23 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 		query GetCollections($cursor: String) {
 			collections(first: %d, after: $cursor, sortKey: UPDATED_AT) {
 				pageInfo { hasNextPage endCursor }
-				edges { node {
-					id title handle descriptionHtml productsCount
-					ruleSet { rules { column relation condition } appliedDisjunctively }
-					sortOrder publishedAt templateSuffix updatedAt
-				} }
+				nodes {
+					id
+					title
+					handle
+					descriptionHtml
+					productsCount {                    
+						count
+					}
+					ruleSet {
+						rules { column relation condition }
+						appliedDisjunctively
+					}
+					sortOrder
+					
+					templateSuffix
+					updatedAt
+				}
 			}
 		}
 	`, pageSize)
@@ -1483,6 +1495,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 		}
 
 		log.Printf("Fetching collection page %d (cursor: %v)\n", pageCount, cursor)
+		log.Printf("COLLECTIONS QUERY:\n%s", query)
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
 			return collectionCount, fmt.Errorf("collection graphql query failed page %d: %w", pageCount, err)
@@ -1497,11 +1510,13 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 			log.Printf("Warning: Invalid 'collections' structure page %d.", pageCount)
 			break
 		}
-		edges, _ := collectionsData["edges"].([]interface{})
+
+		// Updated to use nodes instead of edges
+		nodes, _ := collectionsData["nodes"].([]interface{})
 		pageInfo, piOK := collectionsData["pageInfo"].(map[string]interface{})
 		hasNextPage := piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
 
-		if len(edges) == 0 {
+		if len(nodes) == 0 {
 			log.Printf("Info: No collections found on page %d.", pageCount)
 			if !hasNextPage {
 				break // Exit loop if no edges and no next page
@@ -1515,40 +1530,58 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 			}
 		}
 
-		log.Printf("Processing %d collections from page %d...\n", len(edges), pageCount)
+		log.Printf("Processing %d collections from page %d...\n", len(nodes), pageCount)
 		batch := &pgx.Batch{}
 		pageCollectionCount := 0
-		for _, edge := range edges {
-			nodeMap, _ := edge.(map[string]interface{})
-			node, _ := nodeMap["node"].(map[string]interface{})
-			if node == nil {
+		for _, node := range nodes {
+			nodeMap, ok := node.(map[string]interface{})
+			if !ok || nodeMap == nil {
 				log.Printf("Warning: Skipping invalid collection node page %d", pageCount)
 				continue
 			}
 
-			collectionIDStr := safeGetString(node, "id")
+			collectionIDStr := safeGetString(nodeMap, "id")
 			collectionID := extractIDFromGraphQLID(collectionIDStr)
 			if collectionID == 0 {
 				log.Printf("Warning: Skipping collection GID parse failed page %d: %s", pageCount, collectionIDStr)
 				continue
 			}
 
-			title := safeGetString(node, "title")
-			handle := safeGetString(node, "handle")
-			descriptionHtml := safeGetString(node, "descriptionHtml")
-			sortOrder := safeGetString(node, "sortOrder")
-			templateSuffix := safeGetString(node, "templateSuffix")
-			productsCount := safeGetInt(node, "productsCount")
-			publishedAt := safeGetTimestamp(node, "publishedAt")
-			updatedAt := safeGetTimestamp(node, "updatedAt")
+			title := safeGetString(nodeMap, "title")
+			handle := safeGetString(nodeMap, "handle")
+			descriptionHtml := safeGetString(nodeMap, "descriptionHtml")
+			sortOrder := safeGetString(nodeMap, "sortOrder")
+			templateSuffix := safeGetString(nodeMap, "templateSuffix")
+
+			// Extract productsCount from the nested structure
+			productsCount := 0
+			if pcMap, ok := nodeMap["productsCount"].(map[string]interface{}); ok && pcMap != nil {
+				productsCount = safeGetInt(pcMap, "count")
+			}
+
+			updatedAt := safeGetTimestamp(nodeMap, "updatedAt")
 			productsJSON := []byte("null") // Not fetching product list
-			ruleSetJSON := safeGetJSONB(node, "ruleSet")
+			ruleSetJSON := safeGetJSONB(nodeMap, "ruleSet")
+
+			// Since we don't have access to publishedOnCurrentPublication field
+			// Use updatedAt as the publishedAt timestamp
+			publishedAt := updatedAt
 
 			batch.Queue(`
 				INSERT INTO shopify_sync_collections ( collection_id, title, handle, description, description_html, products_count, products, rule_set, sort_order, published_at, template_suffix, updated_at, sync_date )
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT (collection_id) DO UPDATE SET
-					title = EXCLUDED.title, handle = EXCLUDED.handle, description = EXCLUDED.description, description_html = EXCLUDED.description_html, products_count = EXCLUDED.products_count, products = EXCLUDED.products, rule_set = EXCLUDED.rule_set, sort_order = EXCLUDED.sort_order, published_at = EXCLUDED.published_at, template_suffix = EXCLUDED.template_suffix, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at, sync_date = EXCLUDED.sync_date
+					title = EXCLUDED.title, 
+					handle = EXCLUDED.handle, 
+					description_html = EXCLUDED.description_html, 
+					products_count = EXCLUDED.products_count, 
+					products = EXCLUDED.products, 
+					rule_set = EXCLUDED.rule_set, 
+					sort_order = EXCLUDED.sort_order, 
+					published_at = EXCLUDED.published_at, 
+					template_suffix = EXCLUDED.template_suffix, 
+					updated_at = EXCLUDED.updated_at, 
+					sync_date = EXCLUDED.sync_date
 				WHERE shopify_sync_collections.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR shopify_sync_collections.sync_date != EXCLUDED.sync_date
 			`, collectionID, title, handle, "" /* description */, descriptionHtml, productsCount, productsJSON, ruleSetJSON, sortOrder, publishedAt, templateSuffix, updatedAt, syncDate)
 			pageCollectionCount++
@@ -1667,7 +1700,27 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 				updatedAt := article.UpdatedAt
 
 				// Convert arrays to comma-separated strings
-				tagsString := strings.Join(article.Tags, ",")
+				var tagsString string
+				switch tags := article.Tags.(type) {
+				case []interface{}:
+					// Handle array of strings
+					tagsList := make([]string, 0, len(tags))
+					for _, t := range tags {
+						if tagStr, ok := t.(string); ok {
+							tagsList = append(tagsList, tagStr)
+						}
+					}
+					tagsString = strings.Join(tagsList, ",")
+				case []string:
+					// Handle []string directly
+					tagsString = strings.Join(tags, ",")
+				case string:
+					// Handle already comma-separated string
+					tagsString = tags
+				default:
+					// Handle empty or other cases
+					tagsString = ""
+				}
 
 				// Convert image and SEO data to JSON
 				var imageJSON []byte
@@ -1694,7 +1747,26 @@ func syncBlogArticles(ctx context.Context, conn *pgx.Conn, syncDate string) (int
 				   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
 				 )
 				 ON CONFLICT (blog_id, article_id) DO UPDATE SET
-				   // … same upsert logic …
+				   blog_title = EXCLUDED.blog_title,
+				   title = EXCLUDED.title,
+				   author = EXCLUDED.author,
+				   content = EXCLUDED.content,
+				   content_html = EXCLUDED.content_html,
+				   excerpt = EXCLUDED.excerpt,
+				   handle = EXCLUDED.handle,
+				   image = EXCLUDED.image,
+				   tags = EXCLUDED.tags,
+				   seo = EXCLUDED.seo,
+				   status = EXCLUDED.status,
+				   published_at = EXCLUDED.published_at,
+				   created_at = EXCLUDED.created_at,
+				   updated_at = EXCLUDED.updated_at,
+				   comments_count = EXCLUDED.comments_count,
+				   summary_html = EXCLUDED.summary_html,
+				   template_suffix = EXCLUDED.template_suffix,
+				   sync_date = EXCLUDED.sync_date
+				   WHERE shopify_sync_blog_articles.updated_at IS DISTINCT FROM EXCLUDED.updated_at
+				   OR shopify_sync_blog_articles.sync_date != EXCLUDED.sync_date
 			   `,
 					blogID,
 					articleID,
@@ -1786,23 +1858,23 @@ type ShopifyBlogsResponse struct {
 
 // ShopifyArticle represents an article returned from the Shopify REST API
 type ShopifyArticle struct {
-	ID             int64      `json:"id"`
-	Title          string     `json:"title"`
-	Author         string     `json:"author"`
-	Body           string     `json:"body_html"`
-	BodyValue      string     `json:"body"`
-	BlogID         int64      `json:"blog_id"`
-	Summary        string     `json:"summary_html"`
-	Handle         string     `json:"handle"`
-	Tags           []string   `json:"tags"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	PublishedAt    time.Time  `json:"published_at"`
-	Published      bool       `json:"published"`
-	CommentsCount  int        `json:"comments_count"`
-	TemplateSuffix string     `json:"template_suffix"`
-	Image          *ImageData `json:"image"`
-	SEO            *SEOData   `json:"metafields"`
+	ID             int64       `json:"id"`
+	Title          string      `json:"title"`
+	Author         string      `json:"author"`
+	Body           string      `json:"body_html"`
+	BodyValue      string      `json:"body"`
+	BlogID         int64       `json:"blog_id"`
+	Summary        string      `json:"summary_html"`
+	Handle         string      `json:"handle"`
+	Tags           interface{} `json:"tags"` // Changed from []string to interface{} to handle both string and array formats
+	CreatedAt      time.Time   `json:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at"`
+	PublishedAt    time.Time   `json:"published_at"`
+	Published      bool        `json:"published"`
+	CommentsCount  int         `json:"comments_count"`
+	TemplateSuffix string      `json:"template_suffix"`
+	Image          *ImageData  `json:"image"`
+	SEO            *SEOData    `json:"metafields"`
 }
 
 // ImageData represents an image in the Shopify API
@@ -1916,13 +1988,91 @@ func fetchShopifyArticles(blogID int64, sinceID int64) ([]ShopifyArticle, bool, 
 	}
 	defer resp.Body.Close()
 
-	// Parse the response
-	var articlesResponse ShopifyArticlesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&articlesResponse); err != nil {
-		return nil, false, 0, fmt.Errorf("failed to decode articles response for blog %d: %w", blogID, err)
+	// Read the response body
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("failed to read response body for blog %d: %w", blogID, err)
 	}
 
-	articles := articlesResponse.Articles
+	// Print the raw response for debugging
+	log.Printf("RAW RESPONSE for blog %d: %s", blogID, string(bodyBytes))
+
+	// Parse into a generic map first to handle potential type mismatches
+	var rawResponse map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &rawResponse); err != nil {
+		return nil, false, 0, fmt.Errorf("failed to decode raw JSON response for blog %d: %w", blogID, err)
+	}
+
+	// Extract and convert articles manually
+	articlesRaw, ok := rawResponse["articles"]
+	if !ok || articlesRaw == nil {
+		log.Printf("No 'articles' field found in response for blog %d", blogID)
+		return nil, false, 0, nil
+	}
+
+	articlesArray, ok := articlesRaw.([]interface{})
+	if !ok {
+		return nil, false, 0, fmt.Errorf("articles field is not an array for blog %d", blogID)
+	}
+
+	var articles []ShopifyArticle
+	for _, articleRaw := range articlesArray {
+		articleMap, ok := articleRaw.(map[string]interface{})
+		if !ok {
+			log.Printf("Warning: Skipping invalid article entry (not a map) for blog %d", blogID)
+			continue
+		}
+
+		// Create a new article
+		article := ShopifyArticle{
+			ID:             safeCastInt64(articleMap["id"]),
+			Title:          safeCastString(articleMap["title"]),
+			Author:         safeCastString(articleMap["author"]),
+			Body:           safeCastString(articleMap["body_html"]),
+			BodyValue:      safeCastString(articleMap["body"]),
+			BlogID:         safeCastInt64(articleMap["blog_id"]),
+			Summary:        safeCastString(articleMap["summary_html"]),
+			Handle:         safeCastString(articleMap["handle"]),
+			Tags:           articleMap["tags"], // Store raw tags to handle in processing
+			Published:      safeCastBool(articleMap["published"]),
+			CommentsCount:  safeCastInt(articleMap["comments_count"]),
+			TemplateSuffix: safeCastString(articleMap["template_suffix"]),
+		}
+
+		// Handle dates
+		if createdAt, ok := articleMap["created_at"].(string); ok {
+			article.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		}
+		if updatedAt, ok := articleMap["updated_at"].(string); ok {
+			article.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		}
+		if publishedAt, ok := articleMap["published_at"].(string); ok {
+			article.PublishedAt, _ = time.Parse(time.RFC3339, publishedAt)
+		}
+
+		// Handle image
+		if imgRaw, ok := articleMap["image"].(map[string]interface{}); ok && imgRaw != nil {
+			article.Image = &ImageData{
+				ID:        safeCastInt64(imgRaw["id"]),
+				URL:       safeCastString(imgRaw["src"]),
+				AltText:   safeCastString(imgRaw["alt"]),
+				Width:     safeCastInt(imgRaw["width"]),
+				Height:    safeCastInt(imgRaw["height"]),
+				CreatedAt: safeCastString(imgRaw["created_at"]),
+			}
+		}
+
+		// Handle SEO/metafields
+		if metaRaw, ok := articleMap["metafields"].(map[string]interface{}); ok && metaRaw != nil {
+			article.SEO = &SEOData{
+				Title:       safeCastString(metaRaw["title"]),
+				Description: safeCastString(metaRaw["description"]),
+			}
+		}
+
+		articles = append(articles, article)
+	}
+
 	hasMore := len(articles) >= limit
 
 	// Find the highest ID for pagination
@@ -1934,6 +2084,74 @@ func fetchShopifyArticles(blogID int64, sinceID int64) ([]ShopifyArticle, bool, 
 	}
 
 	return articles, hasMore, nextSinceID, nil
+}
+
+// Helper functions for safe type casting
+func safeCastString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func safeCastInt64(v interface{}) int64 {
+	if v == nil {
+		return 0
+	}
+	switch val := v.(type) {
+	case int64:
+		return val
+	case int:
+		return int64(val)
+	case float64:
+		return int64(val)
+	case string:
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+func safeCastInt(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	switch val := v.(type) {
+	case int:
+		return val
+	case int64:
+		return int(val)
+	case float64:
+		return int(val)
+	case string:
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+func safeCastBool(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		if strings.ToLower(val) == "true" {
+			return true
+		}
+	case int:
+		return val != 0
+	case float64:
+		return val != 0
+	}
+	return false
 }
 
 // executeShopifyRequest handles making Shopify REST API requests with retry logic
