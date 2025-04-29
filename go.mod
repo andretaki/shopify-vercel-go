@@ -1,8 +1,13 @@
-module github.com/yourusername/shopify-vercel-go
+module github.com/andretaki/shopify-vercel-go
 
-go 1.21
+go 1.22
 
-require github.com/jackc/pgx/v4 v4.18.1
+toolchain go1.23.2
+
+require (
+	github.com/jackc/pgx/v4 v4.18.1
+	github.com/joho/godotenv v1.5.1
+)
 
 require (
 	github.com/jackc/chunkreader/v2 v2.0.1 // indirect
@@ -14,5 +19,4 @@ require (
 	github.com/jackc/pgtype v1.14.0 // indirect
 	golang.org/x/crypto v0.20.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
-	github.com/mailgun/mailgun-go/v4 v4.16.0 // indirect
 )

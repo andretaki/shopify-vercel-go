@@ -7,23 +7,27 @@
 *.test
 *.out
 /vendor/
-/go.mod
-/go.sum
+
+# Go modules - Keep these unless vendoring
+# /go.mod
+# /go.sum
 
 # Vercel
-.vercel
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.vercel/
+*.log
 
-# IDE
+# Environment variables
+.env
+.env*.local
+.env.*.local
+
+# IDE - Optional but common
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# OS
+# OS generated files
 .DS_Store
 Thumbs.db
