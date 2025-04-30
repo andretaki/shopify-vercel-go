@@ -43,6 +43,7 @@ func (st *ShipStationTime) UnmarshalJSON(data []byte) error {
 
 	// Try additional formats based on observed responses
 	formats := []string{
+		"2006-01-02",                        // YYYY-MM-DD format
 		"2006-01-02T15:04:05",               // No timezone
 		"2006-01-02T15:04:05.0000000",       // Trailing zeros format
 		"2006-01-02T15:04:05.0000000Z",      // Trailing zeros with Z
