@@ -133,7 +133,7 @@ type ShipStationOrder struct {
 	InternationalOptions     InternationalOptions `json:"internationalOptions"`
 	AdvancedOptions          AdvancedOptions      `json:"advancedOptions"`
 	TagIDs                   []int                `json:"tagIds"`
-	UserID                   *int64               `json:"userId"`
+	UserID                   interface{}          `json:"userId"` // Changed from *int64 to interface{}
 	ExternallyFulfilled      bool                 `json:"externallyFulfilled"`
 	ExternallyFulfilledBy    string               `json:"externallyFulfilledBy"`
 	LabelMessages            *string              `json:"labelMessages"`
@@ -207,12 +207,12 @@ type InternationalOptions struct {
 
 // CustomsItem represents customs information for international shipments
 type CustomsItem struct {
-	CustomsItemID        string  `json:"customsItemId"` // Often string in API response
-	Description          string  `json:"description"`
-	Quantity             int     `json:"quantity"`
-	Value                float64 `json:"value"`
-	HarmonizedTariffCode string  `json:"harmonizedTariffCode"`
-	CountryOfOrigin      string  `json:"countryOfOrigin"` // e.g., "US"
+	CustomsItemID        interface{} `json:"customsItemId"` // Changed from string to interface{} to handle numeric values
+	Description          string      `json:"description"`
+	Quantity             int         `json:"quantity"`
+	Value                float64     `json:"value"`
+	HarmonizedTariffCode string      `json:"harmonizedTariffCode"`
+	CountryOfOrigin      string      `json:"countryOfOrigin"` // e.g., "US"
 }
 
 // AdvancedOptions represents advanced shipping options
@@ -224,16 +224,16 @@ type AdvancedOptions struct {
 	// MergedOrSplit seems less common directly on order, maybe shipment?
 	// MergedIDs            []int   `json:"mergedIds"`
 	// ParentID             *int64  `json:"parentId"`
-	StoreID              *int64  `json:"storeId"`      // Pointer for potential null
-	CustomField1         *string `json:"customField1"` // Use pointers for potentially null custom fields
-	CustomField2         *string `json:"customField2"`
-	CustomField3         *string `json:"customField3"`
-	Source               string  `json:"source"`
-	BillToParty          string  `json:"billToParty"`
-	BillToAccount        string  `json:"billToAccount"`
-	BillToPostalCode     string  `json:"billToPostalCode"`
-	BillToCountryCode    string  `json:"billToCountryCode"`
-	BillToMyOtherAccount *int64  `json:"billToMyOtherAccount"` // Changed from *bool to *int64
+	StoreID              *int64      `json:"storeId"`      // Pointer for potential null
+	CustomField1         *string     `json:"customField1"` // Use pointers for potentially null custom fields
+	CustomField2         *string     `json:"customField2"`
+	CustomField3         *string     `json:"customField3"`
+	Source               string      `json:"source"`
+	BillToParty          string      `json:"billToParty"`
+	BillToAccount        string      `json:"billToAccount"`
+	BillToPostalCode     string      `json:"billToPostalCode"`
+	BillToCountryCode    string      `json:"billToCountryCode"`
+	BillToMyOtherAccount interface{} `json:"billToMyOtherAccount"` // Changed from *int64 to interface{}
 }
 
 // Option represents an item option
@@ -511,6 +511,7 @@ func makeRequestWithRetry(client *http.Client, req *http.Request, rateLimiter *R
 // --- Database Initialization ---
 func initShipStationTables(ctx context.Context, conn *pgx.Conn) error {
 	log.Println("Initializing ShipStation database tables...")
+
 	// Create orders table
 	_, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS shipstation_sync_orders (
@@ -563,6 +564,32 @@ func initShipStationTables(ctx context.Context, conn *pgx.Conn) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create shipstation_sync_orders table: %w", err)
+	}
+
+	// Add potentially missing columns
+	_, err = conn.Exec(ctx, `
+		DO $$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'shipstation_sync_orders') THEN
+				ALTER TABLE shipstation_sync_orders
+				ADD COLUMN IF NOT EXISTS order_total DECIMAL(12,2),
+				ADD COLUMN IF NOT EXISTS amount_paid DECIMAL(12,2),
+				ADD COLUMN IF NOT EXISTS tax_amount DECIMAL(12,2),
+				ADD COLUMN IF NOT EXISTS shipping_amount DECIMAL(12,2),
+				ADD COLUMN IF NOT EXISTS gift BOOLEAN,
+				ADD COLUMN IF NOT EXISTS gift_message TEXT,
+				ADD COLUMN IF NOT EXISTS payment_method TEXT,
+				ADD COLUMN IF NOT EXISTS requested_shipping_service TEXT;
+				
+				-- Ensure user_id column exists and has the right type
+				IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='shipstation_sync_orders' AND column_name='user_id') THEN
+					ALTER TABLE shipstation_sync_orders ADD COLUMN user_id TEXT;
+				END IF;
+			END IF;
+		END $$;
+	`)
+	if err != nil {
+		log.Printf("Warning: Failed to add missing columns to shipstation_sync_orders: %v", err)
 	}
 
 	// Create shipments table
@@ -676,22 +703,6 @@ func initShipStationTables(ctx context.Context, conn *pgx.Conn) error {
 }
 
 // --- Helper Functions for Nullable Types ---
-func nullIfZeroTime(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	return &t
-}
-
-// nullIfZeroShipStationTime converts a ShipStationTime to a SQL NULL if it's zero
-func nullIfZeroShipStationTime(t ShipStationTime) *time.Time {
-	tm := t.Time()
-	if tm.IsZero() {
-		return nil
-	}
-	return &tm
-}
-
 // nullIfZeroShipStationTimePtr converts a *ShipStationTime to a SQL NULL if it's nil or zero
 func nullIfZeroShipStationTimePtr(t *ShipStationTime) *time.Time {
 	if t == nil {
@@ -706,7 +717,6 @@ func nullIfZeroShipStationTimePtr(t *ShipStationTime) *time.Time {
 
 func nullIfNilInt(i *int64) *int64      { return i }
 func nullIfNilString(s *string) *string { return s }
-func nullIfNilBool(b *bool) *bool       { return b }
 
 // --- END Helper Functions for Nullable Types ---
 
@@ -803,6 +813,25 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 			advancedOptionsJSON, _ := json.Marshal(order.AdvancedOptions)
 			tagIDsJSON, _ := json.Marshal(order.TagIDs)
 
+			// Handle interface{} UserID before DB insert
+			var dbUserID interface{}
+			switch v := order.UserID.(type) {
+			case string:
+				dbUserID = v // It's already a string
+			case float64: // JSON numbers often decode as float64
+				dbUserID = int64(v) // Convert to int64
+			case int:
+				dbUserID = int64(v) // Convert to int64
+			case int64:
+				dbUserID = v // Already the right type
+			case nil:
+				dbUserID = nil
+			default:
+				// Attempt to convert any other type to string
+				log.Printf("Warning: Unexpected type for UserID (%T), attempting string conversion for order %d", v, order.OrderID)
+				dbUserID = fmt.Sprintf("%v", v)
+			}
+
 			batch.Queue(`
 				INSERT INTO shipstation_sync_orders (
 					order_id, order_number, order_key, order_date, create_date, modify_date, payment_date, ship_by_date,
@@ -839,7 +868,7 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 				order.AmountPaid, order.TaxAmount, order.ShippingAmount, order.CustomerNotes, order.InternalNotes, order.Gift, order.GiftMessage, order.PaymentMethod,
 				order.RequestedShippingService, order.CarrierCode, order.ServiceCode, order.PackageCode, order.Confirmation, nullIfZeroShipStationTimePtr(order.ShipDate),
 				nullIfZeroShipStationTimePtr(order.HoldUntilDate), weightJSON, dimensionsJSON, insuranceOptionsJSON, internationalOptionsJSON, advancedOptionsJSON,
-				tagIDsJSON, nullIfNilInt(order.UserID), order.ExternallyFulfilled, order.ExternallyFulfilledBy, nullIfNilString(order.LabelMessages), syncDate,
+				tagIDsJSON, dbUserID, order.ExternallyFulfilled, order.ExternallyFulfilledBy, nullIfNilString(order.LabelMessages), syncDate,
 			)
 			pageOrderCount++
 		}

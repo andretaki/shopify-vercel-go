@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -116,7 +117,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			errorMsg += err.Error()
 		}
 		log.Printf("Error: %v\n", errorMsg)
-		respondWithError(w, http.StatusInternalServerError, fmt.Errorf(errorMsg))
+		respondWithError(w, http.StatusInternalServerError, errors.New(errorMsg))
 		SendSystemErrorNotification("Config Error", errorMsg)
 		return
 	}
