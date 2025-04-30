@@ -27,11 +27,15 @@ func main() {
 	}
 
 	// Check required environment variables for all handlers
+	// MODIFIED: Removed SHOPIFY_ACCESS_TOKEN from this *startup* check.
+	// Individual handlers will still check for what they need when called.
 	requiredEnvVars := []string{
 		// Common
 		"DATABASE_URL",
-		// Shopify
-		"SHOPIFY_STORE", "SHOPIFY_ACCESS_TOKEN",
+		// Shopify (Core App Keys - Access Token checked by handler)
+		"SHOPIFY_STORE",
+		"SHOPIFY_API_KEY", // Keep check for API key/secret if needed elsewhere
+		"SHOPIFY_API_SECRET",
 		// ShipStation
 		"SHIPSTATION_API_KEY", "SHIPSTATION_API_SECRET",
 		// Notifications
@@ -39,7 +43,8 @@ func main() {
 	}
 	missingVars := false
 	for _, envVar := range requiredEnvVars {
-		if os.Getenv(envVar) == "" {
+		// Check if the variable is actually set *and* not empty
+		if val := os.Getenv(envVar); val == "" {
 			log.Printf("Error: Required environment variable %s is not set.", envVar)
 			missingVars = true
 		}
@@ -47,7 +52,11 @@ func main() {
 	if missingVars {
 		log.Fatal("Exiting due to missing required environment variables.")
 	} else {
-		log.Println("All required environment variables are present.")
+		log.Println("All required environment variables checked at startup are present.")
+		// Note about the access token
+		if os.Getenv("SHOPIFY_ACCESS_TOKEN") == "" {
+			log.Println("Info: SHOPIFY_ACCESS_TOKEN is not set. Using SHOPIFY_API_SECRET as the access token.")
+		}
 	}
 
 	// Create a simple HTTP server and register handlers

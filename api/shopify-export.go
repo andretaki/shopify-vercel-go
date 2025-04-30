@@ -106,12 +106,18 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shopifyStore := os.Getenv("SHOPIFY_STORE")
-	accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN")
-	if shopifyStore == "" || accessToken == "" {
-		err := fmt.Errorf("missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN environment variables")
-		log.Printf("Error: %v\n", err)
-		respondWithError(w, http.StatusInternalServerError, err)
-		SendSystemErrorNotification("Config Error", err.Error())
+	// Use our helper function to get the access token
+	_, err := getShopifyAccessToken()
+	if err != nil || shopifyStore == "" {
+		errorMsg := "Shopify credentials error: "
+		if shopifyStore == "" {
+			errorMsg += "SHOPIFY_STORE not set"
+		} else {
+			errorMsg += err.Error()
+		}
+		log.Printf("Error: %v\n", errorMsg)
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf(errorMsg))
+		SendSystemErrorNotification("Config Error", errorMsg)
 		return
 	}
 
@@ -419,12 +425,38 @@ func handleRateLimit(extensions map[string]interface{}) (time.Duration, error) {
 	return 0, nil
 }
 
-// executeGraphQLQuery (Shared) - With improved logging and retry logic
+// getShopifyAccessToken generates or retrieves a Shopify Admin API access token
+// using the API key and secret instead of requiring a pre-configured access token
+func getShopifyAccessToken() (string, error) {
+	// First check if an access token is already set (it's still valid to provide one directly)
+	if accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN"); accessToken != "" {
+		return accessToken, nil
+	}
+
+	// If not, check for API key and secret
+	apiKey := os.Getenv("SHOPIFY_API_KEY")
+	apiSecret := os.Getenv("SHOPIFY_API_SECRET")
+	shopName := os.Getenv("SHOPIFY_STORE")
+
+	if apiKey == "" || apiSecret == "" || shopName == "" {
+		return "", fmt.Errorf("missing required Shopify credentials: SHOPIFY_API_KEY, SHOPIFY_API_SECRET, and SHOPIFY_STORE are all required")
+	}
+
+	// For Admin API access, the access token is the API password/secret
+	// This is a common pattern for Shopify API authentication
+	return apiSecret, nil
+}
+
+// executeGraphQLQuery executes a GraphQL query against the Shopify Admin API
 func executeGraphQLQuery(query string, variables map[string]interface{}) (map[string]interface{}, error) {
 	shopName := os.Getenv("SHOPIFY_STORE")
-	accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN")
-	if shopName == "" || accessToken == "" {
-		return nil, fmt.Errorf("SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN not set")
+	// Get access token using our helper function
+	accessToken, err := getShopifyAccessToken()
+	if err != nil {
+		return nil, err
+	}
+	if shopName == "" {
+		return nil, fmt.Errorf("SHOPIFY_STORE environment variable not set")
 	}
 
 	apiVersion := "2024-04" // Make this configurable if needed later
@@ -878,7 +910,7 @@ func extractMoneyValue(node map[string]interface{}, priceSetKey string) float64 
 // syncProducts fetches and stores Shopify products
 func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	log.Println("Starting Shopify product sync...")
-	pageSize := 20 // Adjust as needed
+	pageSize := 250 // Use larger page size for better performance
 	query := fmt.Sprintf(`
 		query GetProducts($cursor: String) {
 			products(first: %d, after: $cursor, sortKey: UPDATED_AT) {
@@ -1044,14 +1076,14 @@ func syncProducts(ctx context.Context, conn *pgx.Conn, syncDate string) (int, er
 	if err := tx.Commit(ctx); err != nil {
 		return productCount, fmt.Errorf("failed to commit product transaction: %w", err)
 	}
-	log.Printf("✅ Successfully synced %d Shopify products across %d pages.\n", productCount, pageCount)
+	log.Printf("✅ Successfully synced %d Shopify products across %d pages (pageSize=%d).\n", productCount, pageCount, pageSize)
 	return productCount, nil
 }
 
 // syncCustomers fetches and stores Shopify customers
 func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	log.Println("Starting Shopify customer sync...")
-	pageSize := 20
+	pageSize := 250 // Use larger page size for better performance
 	query := fmt.Sprintf(`
 		query GetCustomers($cursor: String) {
 			customers(first: %d, after: $cursor, sortKey: UPDATED_AT) {
@@ -1212,50 +1244,50 @@ func syncCustomers(ctx context.Context, conn *pgx.Conn, syncDate string) (int, e
 	if err := tx.Commit(ctx); err != nil {
 		return customerCount, fmt.Errorf("failed to commit customer transaction: %w", err)
 	}
-	log.Printf("✅ Successfully synced %d Shopify customers across %d pages.\n", customerCount, pageCount)
+	log.Printf("✅ Successfully synced %d Shopify customers across %d pages (pageSize=%d).\n", customerCount, pageCount, pageSize)
 	return customerCount, nil
 }
 
 // syncOrders fetches and stores Shopify orders (Version 8 - Includes Price Sets)
 func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	log.Println("Starting Shopify order sync...")
-	pageSize := 10 // Orders can be complex, keep page size reasonable
+	pageSize := 250 // Use larger page size for better performance (Max allowed, adjust lower e.g. 50 or 100 if orders are very heavy and cause other issues)
 	// CORRECTED QUERY v8: Reintroducing Price Sets
 	query := fmt.Sprintf(`
 		query GetOrders($cursor: String) {
-			orders(first: %d, after: $cursor, sortKey: UPDATED_AT) {
-				pageInfo { hasNextPage endCursor }
-				edges { node {
-					id
-					name
-					# orderNumber           # Removed deprecated field
-					customer { id }
-					email
-					phone
-					displayFinancialStatus
-					displayFulfillmentStatus
-					processedAt
-					currencyCode
-					# --- Price Sets Re-added ---
-					totalPriceSet { shopMoney { amount } }
-					subtotalPriceSet { shopMoney { amount } }
-					totalTaxSet { shopMoney { amount } }
-					totalDiscountsSet { shopMoney { amount } }
-					totalShippingPriceSet { shopMoney { amount } }
-					# --- Addresses still removed ---
-					# billingAddress { address1 address2 city company countryCode firstName lastName phone provinceCode zip name }
-					# shippingAddress { address1 address2 city company countryCode firstName lastName phone provinceCode zip name }
-					# --- Complex Connections still removed ---
-					# lineItems(first: 50) { edges { node { id title quantity variant { id sku } originalTotalSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } } } } }
-					# shippingLines(first: 5) { edges { node { id title carrierIdentifier originalPriceSet { shopMoney { amount } } discountedPriceSet { shopMoney { amount } } } } }
-					# discountApplications(first: 10) { edges { node { __typename ... on DiscountApplicationInterface { allocationMethod targetSelection targetType value { ... on MoneyV2 { amount currencyCode } ... on PricingPercentageValue { percentage } } } ... on AutomaticDiscountApplication { title } ... on ManualDiscountApplication { title description } ... on ScriptDiscountApplication { title } ... on DiscountCodeApplication { code applicable } } } }
-					note
-					tags
-					createdAt
-					updatedAt
-				} } # End node
-			} # End orders
-		} # End query
+				orders(first: %d, after: $cursor, sortKey: UPDATED_AT) {
+					pageInfo { hasNextPage endCursor }
+					edges { node {
+						id
+						name
+						# orderNumber           # Removed deprecated field
+						customer { id }
+						email
+						phone
+						displayFinancialStatus
+						displayFulfillmentStatus
+						processedAt
+						currencyCode
+						# --- Price Sets Re-added ---
+						totalPriceSet { shopMoney { amount } }
+						subtotalPriceSet { shopMoney { amount } }
+						totalTaxSet { shopMoney { amount } }
+						totalDiscountsSet { shopMoney { amount } }
+						totalShippingPriceSet { shopMoney { amount } }
+						# --- Addresses still removed ---
+						# billingAddress { address1 address2 city company countryCode firstName lastName phone provinceCode zip name }
+						# shippingAddress { address1 address2 city company countryCode firstName lastName phone provinceCode zip name }
+						# --- Complex Connections still removed ---
+						# lineItems(first: 50) { edges { node { id title quantity variant { id sku } originalTotalSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } } } } }
+						# shippingLines(first: 5) { edges { node { id title carrierIdentifier originalPriceSet { shopMoney { amount } } discountedPriceSet { shopMoney { amount } } } } }
+						# discountApplications(first: 10) { edges { node { __typename ... on DiscountApplicationInterface { allocationMethod targetSelection targetType value { ... on MoneyV2 { amount currencyCode } ... on PricingPercentageValue { percentage } } } ... on AutomaticDiscountApplication { title } ... on ManualDiscountApplication { title description } ... on ScriptDiscountApplication { title } ... on DiscountCodeApplication { code applicable } } } }
+						note
+						tags
+						createdAt
+						updatedAt
+					} } # End node
+				} # End orders
+			} # End query
 	`, pageSize)
 
 	tx, err := conn.Begin(ctx)
@@ -1444,14 +1476,14 @@ func syncOrders(ctx context.Context, conn *pgx.Conn, syncDate string) (int, erro
 		return orderCount, fmt.Errorf("failed to commit order tx (v8 - pricesets): %w", err)
 	}
 
-	log.Printf("✅ Successfully synced %d Shopify orders across %d pages (v8 - pricesets sync).\n", orderCount, pageCount)
+	log.Printf("✅ Successfully synced %d Shopify orders across %d pages (pageSize=%d, v8 - pricesets sync).\n", orderCount, pageCount, pageSize)
 	return orderCount, nil
 }
 
 // syncCollections fetches and stores Shopify collections
 func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int, error) {
 	log.Println("Starting Shopify collection sync...")
-	pageSize := 20
+	pageSize := 250 // Use larger page size for better performance
 	query := fmt.Sprintf(`
 		query GetCollections($cursor: String) {
 			collections(first: %d, after: $cursor, sortKey: UPDATED_AT) {
@@ -1461,7 +1493,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 					title
 					handle
 					descriptionHtml
-					productsCount {                    
+					productsCount {
 						count
 					}
 					ruleSet {
@@ -1469,7 +1501,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 						appliedDisjunctively
 					}
 					sortOrder
-					
+
 					templateSuffix
 					updatedAt
 				}
@@ -1627,7 +1659,7 @@ func syncCollections(ctx context.Context, conn *pgx.Conn, syncDate string) (int,
 	if err := tx.Commit(ctx); err != nil {
 		return collectionCount, fmt.Errorf("failed to commit collection transaction: %w", err)
 	}
-	log.Printf("✅ Successfully synced %d Shopify collections across %d pages.\n", collectionCount, pageCount)
+	log.Printf("✅ Successfully synced %d Shopify collections across %d pages (pageSize=%d).\n", collectionCount, pageCount, pageSize)
 	return collectionCount, nil
 }
 
@@ -1901,9 +1933,12 @@ type ShopifyArticlesResponse struct {
 // fetchShopifyBlogs retrieves the list of blogs from Shopify
 func fetchShopifyBlogs() ([]ShopifyBlog, error) {
 	shopName := os.Getenv("SHOPIFY_STORE")
-	accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN")
-	if shopName == "" || accessToken == "" {
-		return nil, fmt.Errorf("SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN not set")
+	accessToken, err := getShopifyAccessToken()
+	if err != nil {
+		return nil, err
+	}
+	if shopName == "" {
+		return nil, fmt.Errorf("SHOPIFY_STORE not set")
 	}
 
 	apiVersion := "2024-04" // Keep consistent with GraphQL version used elsewhere
@@ -1947,9 +1982,12 @@ func fetchShopifyBlogs() ([]ShopifyBlog, error) {
 // fetchShopifyArticles retrieves articles for a specific blog from Shopify with pagination
 func fetchShopifyArticles(blogID int64, sinceID int64) ([]ShopifyArticle, bool, int64, error) {
 	shopName := os.Getenv("SHOPIFY_STORE")
-	accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN")
-	if shopName == "" || accessToken == "" {
-		return nil, false, 0, fmt.Errorf("SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN not set")
+	accessToken, err := getShopifyAccessToken()
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if shopName == "" {
+		return nil, false, 0, fmt.Errorf("SHOPIFY_STORE not set")
 	}
 
 	apiVersion := "2024-04" // Keep consistent with GraphQL version used elsewhere

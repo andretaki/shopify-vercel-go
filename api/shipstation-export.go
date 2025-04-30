@@ -10,34 +10,107 @@ import (
 	"log" // Added standard log
 	"math"
 	"net/http"
+	"net/url" // Added for URL encoding
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v4"
 )
 
-// --- ShipStation Data Structures (Keep as is) ---
+// --- ShipStation Custom Time Handling ---
+
+// ShipStationTime is a custom time type to handle various formats sent by ShipStation API
+type ShipStationTime time.Time
+
+// UnmarshalJSON implements custom unmarshaling for ShipStation's variable time formats
+func (st *ShipStationTime) UnmarshalJSON(data []byte) error {
+	// Remove quotes
+	s := strings.Trim(string(data), "\"")
+	if s == "null" || s == "" {
+		*st = ShipStationTime(time.Time{})
+		return nil
+	}
+
+	// Try standard RFC3339 format first
+	t, err := time.Parse(time.RFC3339, s)
+	if err == nil {
+		*st = ShipStationTime(t)
+		return nil
+	}
+
+	// Try additional formats based on observed responses
+	formats := []string{
+		"2006-01-02T15:04:05",               // No timezone
+		"2006-01-02T15:04:05.0000000",       // Trailing zeros format
+		"2006-01-02T15:04:05.0000000Z",      // Trailing zeros with Z
+		"2006-01-02T15:04:05.9999999Z",      // Full precision with Z
+		"2006-01-02T15:04:05.999-07:00",     // With timezone offset
+		"2006-01-02T15:04:05.9999999-07:00", // Full precision with timezone
+		"2006-01-02T15:04:05-07:00",         // No fraction but with timezone
+		time.RFC3339Nano,                    // Full precision RFC3339
+	}
+
+	for _, format := range formats {
+		t, err = time.Parse(format, s)
+		if err == nil {
+			*st = ShipStationTime(t)
+			return nil
+		}
+	}
+
+	// Log the problematic time format
+	log.Printf("WARNING: Could not parse ShipStation time format: %s. Trying simplified approach.", s)
+
+	// Last resort: try to parse just the date and time portion
+	if len(s) >= 19 {
+		basicTime := s[:19] // Extract YYYY-MM-DDThh:mm:ss
+		t, err = time.Parse("2006-01-02T15:04:05", basicTime)
+		if err == nil {
+			*st = ShipStationTime(t)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("unable to parse time %q with any known format", s)
+}
+
+// MarshalJSON implements custom marshaling
+func (st ShipStationTime) MarshalJSON() ([]byte, error) {
+	t := time.Time(st)
+	if t.IsZero() {
+		return []byte("null"), nil
+	}
+	return []byte(fmt.Sprintf("\"%s\"", t.Format(time.RFC3339))), nil
+}
+
+// Time returns the time.Time representation
+func (st ShipStationTime) Time() time.Time {
+	return time.Time(st)
+}
+
+// --- ShipStation Data Structures (Updated with custom time type) ---
 
 // ShipStationOrder represents a ShipStation order
 type ShipStationOrder struct {
 	OrderID                  int64                `json:"orderId"`
 	OrderNumber              string               `json:"orderNumber"`
 	OrderKey                 string               `json:"orderKey"`
-	OrderDate                time.Time            `json:"orderDate"`
-	CreateDate               time.Time            `json:"createDate"`
-	ModifyDate               time.Time            `json:"modifyDate"`
-	PaymentDate              time.Time            `json:"paymentDate"`
-	ShipByDate               *time.Time           `json:"shipByDate"` // Pointer for potential null
+	OrderDate                ShipStationTime      `json:"orderDate"`   // Using custom time type
+	CreateDate               ShipStationTime      `json:"createDate"`  // Using custom time type
+	ModifyDate               ShipStationTime      `json:"modifyDate"`  // Using custom time type
+	PaymentDate              ShipStationTime      `json:"paymentDate"` // Using custom time type
+	ShipByDate               *ShipStationTime     `json:"shipByDate"`  // Using custom time type
 	OrderStatus              string               `json:"orderStatus"`
-	CustomerID               *int64               `json:"customerId"` // Pointer for potential null
+	CustomerID               *int64               `json:"customerId"`
 	CustomerUsername         string               `json:"customerUsername"`
 	CustomerEmail            string               `json:"customerEmail"`
 	BillTo                   Address              `json:"billTo"`
 	ShipTo                   Address              `json:"shipTo"`
 	Items                    []Item               `json:"items"`
-	OrderTotal               float64              `json:"orderTotal"` // Use OrderTotal if AmountPaid might not be accurate
+	OrderTotal               float64              `json:"orderTotal"`
 	AmountPaid               float64              `json:"amountPaid"`
 	TaxAmount                float64              `json:"taxAmount"`
 	ShippingAmount           float64              `json:"shippingAmount"`
@@ -46,24 +119,23 @@ type ShipStationOrder struct {
 	Gift                     bool                 `json:"gift"`
 	GiftMessage              string               `json:"giftMessage"`
 	PaymentMethod            string               `json:"paymentMethod"`
-	RequestedShippingService string               `json:"requestedShippingService"` // Renamed from shippingMethod for clarity
+	RequestedShippingService string               `json:"requestedShippingService"`
 	CarrierCode              string               `json:"carrierCode"`
 	ServiceCode              string               `json:"serviceCode"`
 	PackageCode              string               `json:"packageCode"`
 	Confirmation             string               `json:"confirmation"`
-	ShipDate                 *time.Time           `json:"shipDate"`      // Pointer for potential null
-	HoldUntilDate            *time.Time           `json:"holdUntilDate"` // Pointer for potential null
+	ShipDate                 *ShipStationTime     `json:"shipDate"`      // Using custom time type
+	HoldUntilDate            *ShipStationTime     `json:"holdUntilDate"` // Using custom time type
 	Weight                   Weight               `json:"weight"`
-	Dimensions               *Dimensions          `json:"dimensions"` // Pointer for potential null
+	Dimensions               *Dimensions          `json:"dimensions"`
 	InsuranceOptions         InsuranceOptions     `json:"insuranceOptions"`
 	InternationalOptions     InternationalOptions `json:"internationalOptions"`
 	AdvancedOptions          AdvancedOptions      `json:"advancedOptions"`
-	TagIDs                   []int                `json:"tagIds"` // Use int as tag IDs are typically int
-	UserID                   *int64               `json:"userId"` // Pointer for potential null
+	TagIDs                   []int                `json:"tagIds"`
+	UserID                   *int64               `json:"userId"`
 	ExternallyFulfilled      bool                 `json:"externallyFulfilled"`
 	ExternallyFulfilledBy    string               `json:"externallyFulfilledBy"`
-	LabelMessages            *string              `json:"labelMessages"` // Pointer for potential null
-	// Custom fields are part of AdvancedOptions now based on typical structure
+	LabelMessages            *string              `json:"labelMessages"`
 }
 
 // Address represents a shipping or billing address
@@ -84,24 +156,24 @@ type Address struct {
 
 // Item represents an order item
 type Item struct {
-	OrderItemID       int64     `json:"orderItemId"`
-	LineItemKey       string    `json:"lineItemKey"`
-	SKU               string    `json:"sku"`
-	Name              string    `json:"name"`
-	ImageURL          string    `json:"imageUrl"`
-	Weight            *Weight   `json:"weight"` // Pointer for potential null
-	Quantity          int       `json:"quantity"`
-	UnitPrice         *float64  `json:"unitPrice"`      // Pointer for potential null
-	TaxAmount         *float64  `json:"taxAmount"`      // Pointer for potential null
-	ShippingAmount    *float64  `json:"shippingAmount"` // Pointer for potential null
-	WarehouseLocation string    `json:"warehouseLocation"`
-	Options           []Option  `json:"options"`
-	ProductID         *int64    `json:"productId"` // Pointer for potential null
-	FulfillmentSKU    string    `json:"fulfillmentSku"`
-	Adjustment        bool      `json:"adjustment"`
-	UPC               string    `json:"upc"`
-	CreateDate        time.Time `json:"createDate"`
-	ModifyDate        time.Time `json:"modifyDate"`
+	OrderItemID       int64           `json:"orderItemId"`
+	LineItemKey       string          `json:"lineItemKey"`
+	SKU               string          `json:"sku"`
+	Name              string          `json:"name"`
+	ImageURL          string          `json:"imageUrl"`
+	Weight            *Weight         `json:"weight"`
+	Quantity          int             `json:"quantity"`
+	UnitPrice         *float64        `json:"unitPrice"`
+	TaxAmount         *float64        `json:"taxAmount"`
+	ShippingAmount    *float64        `json:"shippingAmount"`
+	WarehouseLocation string          `json:"warehouseLocation"`
+	Options           []Option        `json:"options"`
+	ProductID         *int64          `json:"productId"`
+	FulfillmentSKU    string          `json:"fulfillmentSku"`
+	Adjustment        bool            `json:"adjustment"`
+	UPC               string          `json:"upc"`
+	CreateDate        ShipStationTime `json:"createDate"`
+	ModifyDate        ShipStationTime `json:"modifyDate"`
 }
 
 // Weight represents weight information
@@ -189,39 +261,36 @@ type ShipStationShipment struct {
 	ShipmentID          int64            `json:"shipmentId"`
 	OrderID             int64            `json:"orderId"`
 	OrderKey            string           `json:"orderKey"`
-	UserID              *string          `json:"userId"` // User ID might be string UUID
+	UserID              *string          `json:"userId"`
 	CustomerEmail       string           `json:"customerEmail"`
 	OrderNumber         string           `json:"orderNumber"`
-	CreateDate          time.Time        `json:"createDate"`
-	ShipDate            time.Time        `json:"shipDate"`
-	ShipmentCost        float64          `json:"shipmentCost"` // Renamed from shipCost
+	CreateDate          ShipStationTime  `json:"createDate"`
+	ShipDate            ShipStationTime  `json:"shipDate"`
+	ShipmentCost        float64          `json:"shipmentCost"`
 	InsuranceCost       float64          `json:"insuranceCost"`
 	TrackingNumber      string           `json:"trackingNumber"`
 	IsReturnLabel       bool             `json:"isReturnLabel"`
-	BatchNumber         *string          `json:"batchNumber"` // Pointer for potential null
+	BatchNumber         *string          `json:"batchNumber"`
 	CarrierCode         string           `json:"carrierCode"`
 	ServiceCode         string           `json:"serviceCode"`
 	PackageCode         string           `json:"packageCode"`
 	Confirmation        string           `json:"confirmation"`
 	WarehouseID         *int64           `json:"warehouseId"`
 	Voided              bool             `json:"voided"`
-	VoidDate            *time.Time       `json:"voidDate"`
+	VoidDate            *ShipStationTime `json:"voidDate"`
 	MarketplaceNotified bool             `json:"marketplaceNotified"`
 	NotifyErrorMessage  *string          `json:"notifyErrorMessage"`
 	ShipTo              Address          `json:"shipTo"`
 	Weight              Weight           `json:"weight"`
 	Dimensions          *Dimensions      `json:"dimensions"`
 	InsuranceOptions    InsuranceOptions `json:"insuranceOptions"`
-	AdvancedOptions     AdvancedOptions  `json:"advancedOptions"` // Assumes same structure as order advanced options
-	ShipmentItems       []ShipmentItem   `json:"shipmentItems"`   // Use ShipmentItem structure
-	// LabelData and FormData are often large and might not be needed for sync
-	// LabelData           *string          `json:"labelData"` // Base64 encoded PDF data
-	// FormData            *string          `json:"formData"` // Customs form data
+	AdvancedOptions     AdvancedOptions  `json:"advancedOptions"`
+	ShipmentItems       []ShipmentItem   `json:"shipmentItems"`
 }
 
 // ShipmentItem represents an item within a shipment (similar to order item but might differ slightly)
 type ShipmentItem struct {
-	OrderItemID       *int64   `json:"orderItemId"` // Pointer as it might not always be present
+	OrderItemID       *int64   `json:"orderItemId"`
 	LineItemKey       string   `json:"lineItemKey"`
 	SKU               string   `json:"sku"`
 	Name              string   `json:"name"`
@@ -229,8 +298,8 @@ type ShipmentItem struct {
 	Weight            *Weight  `json:"weight"`
 	Quantity          int      `json:"quantity"`
 	UnitPrice         *float64 `json:"unitPrice"`
-	TaxAmount         *float64 `json:"taxAmount"`      // Usually null on shipment item
-	ShippingAmount    *float64 `json:"shippingAmount"` // Usually null on shipment item
+	TaxAmount         *float64 `json:"taxAmount"`
+	ShippingAmount    *float64 `json:"shippingAmount"`
 	WarehouseLocation string   `json:"warehouseLocation"`
 	Options           []Option `json:"options"`
 	ProductID         *int64   `json:"productId"`
@@ -414,8 +483,16 @@ func makeRequestWithRetry(client *http.Client, req *http.Request, rateLimiter *R
 		if resp.StatusCode >= 400 {
 			bodyBytes, _ := ioutil.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("client error %d on attempt %d: %s", resp.StatusCode, attempt+1, string(bodyBytes))
+
+			// More detailed error message with full response body
+			errorBody := string(bodyBytes)
+			lastErr = fmt.Errorf("client error %d on attempt %d: %s", resp.StatusCode, attempt+1, errorBody)
+
+			// Log the complete error response for debugging
+			log.Printf("Detailed API error response: %s", errorBody)
+			log.Printf("Request URL that failed: %s", currentReq.URL.String())
 			log.Printf("Non-retryable client error: %v", lastErr)
+
 			return resp, lastErr // Return the response and the error, indicates failure
 		}
 
@@ -605,12 +682,25 @@ func nullIfZeroTime(t time.Time) *time.Time {
 	return &t
 }
 
-// Added new helper for pointer time values
-func nullIfZeroTimePtr(t *time.Time) *time.Time {
-	if t == nil || t.IsZero() {
+// nullIfZeroShipStationTime converts a ShipStationTime to a SQL NULL if it's zero
+func nullIfZeroShipStationTime(t ShipStationTime) *time.Time {
+	tm := t.Time()
+	if tm.IsZero() {
 		return nil
 	}
-	return t
+	return &tm
+}
+
+// nullIfZeroShipStationTimePtr converts a *ShipStationTime to a SQL NULL if it's nil or zero
+func nullIfZeroShipStationTimePtr(t *ShipStationTime) *time.Time {
+	if t == nil {
+		return nil
+	}
+	tm := t.Time()
+	if tm.IsZero() {
+		return nil
+	}
+	return &tm
 }
 
 func nullIfNilInt(i *int64) *int64      { return i }
@@ -627,7 +717,8 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 	baseURL := "https://ssapi.shipstation.com/orders"
 	rateLimiter := NewRateLimiter(35)
 
-	modifyDateStart := time.Now().AddDate(0, 0, -30).Format("2006-01-02 15:04:05")
+	// Change date format from "2006-01-02 15:04:05" to "2006-01-02"
+	modifyDateStart := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	log.Printf("Syncing ShipStation orders modified since %s", modifyDateStart)
 
 	page := 1
@@ -635,7 +726,9 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 	syncErrors := []SyncError{} // Not currently used to halt process, but could be
 
 	for {
-		reqURL := fmt.Sprintf("%s?page=%d&pageSize=500&sortBy=ModifyDate&sortDir=ASC&modifyDateStart=%s", baseURL, page, modifyDateStart)
+		// Reduce page size from 500 to 100 and properly encode parameters
+		reqURL := fmt.Sprintf("%s?page=%d&pageSize=100&sortBy=ModifyDate&sortDir=ASC&modifyDateStart=%s",
+			baseURL, page, url.QueryEscape(modifyDateStart))
 		req, err := http.NewRequest("GET", reqURL, nil)
 		if err != nil {
 			return totalSynced, fmt.Errorf("error creating order request for page %d: %w", page, err)
@@ -662,11 +755,26 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 			return totalSynced, fmt.Errorf("error reading order response body for page %d: %w", page, err)
 		}
 
+		// Add detailed logging before JSON unmarshaling
+		log.Printf("Raw ShipStation API response (page %d): %s", page, string(body))
+
 		var shipStationResp ShipStationResponse
 		if err := json.Unmarshal(body, &shipStationResp); err != nil {
-			log.Printf("Error parsing ShipStation orders response (page %d): %v. Body: %s", page, err, string(body))
+			// Enhanced error logging with more details about the error
+			log.Printf("ERROR parsing ShipStation orders response (page %d): %v", page, err)
+			log.Printf("JSON unmarshal error details: %s", err.Error())
+
+			// Try to unmarshal the response to a generic structure to see what was returned
+			var genericResp map[string]interface{}
+			if jsonErr := json.Unmarshal(body, &genericResp); jsonErr == nil {
+				log.Printf("Response structure: %+v", genericResp)
+			}
+
 			return totalSynced, fmt.Errorf("error parsing shipstation orders response for page %d: %w", page, err)
 		}
+
+		// Add logging after successful unmarshaling
+		log.Printf("Successfully parsed ShipStation response for page %d: %d orders", page, len(shipStationResp.Orders))
 
 		log.Printf("Processing order page %d/%d, %d orders on page, %d total orders in filter.",
 			shipStationResp.Page, shipStationResp.Pages, len(shipStationResp.Orders), shipStationResp.Total)
@@ -725,11 +833,11 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 				WHERE shipstation_sync_orders.modify_date < EXCLUDED.modify_date
 				   OR shipstation_sync_orders.sync_date != EXCLUDED.sync_date
 			`,
-				order.OrderID, order.OrderNumber, order.OrderKey, order.OrderDate, order.CreateDate, order.ModifyDate, order.PaymentDate, nullIfZeroTimePtr(order.ShipByDate),
+				order.OrderID, order.OrderNumber, order.OrderKey, order.OrderDate.Time(), order.CreateDate.Time(), order.ModifyDate.Time(), order.PaymentDate.Time(), nullIfZeroShipStationTimePtr(order.ShipByDate),
 				order.OrderStatus, nullIfNilInt(order.CustomerID), order.CustomerUsername, order.CustomerEmail, billToJSON, shipToJSON, itemsJSON, order.OrderTotal,
 				order.AmountPaid, order.TaxAmount, order.ShippingAmount, order.CustomerNotes, order.InternalNotes, order.Gift, order.GiftMessage, order.PaymentMethod,
-				order.RequestedShippingService, order.CarrierCode, order.ServiceCode, order.PackageCode, order.Confirmation, nullIfZeroTimePtr(order.ShipDate),
-				nullIfZeroTimePtr(order.HoldUntilDate), weightJSON, dimensionsJSON, insuranceOptionsJSON, internationalOptionsJSON, advancedOptionsJSON,
+				order.RequestedShippingService, order.CarrierCode, order.ServiceCode, order.PackageCode, order.Confirmation, nullIfZeroShipStationTimePtr(order.ShipDate),
+				nullIfZeroShipStationTimePtr(order.HoldUntilDate), weightJSON, dimensionsJSON, insuranceOptionsJSON, internationalOptionsJSON, advancedOptionsJSON,
 				tagIDsJSON, nullIfNilInt(order.UserID), order.ExternallyFulfilled, order.ExternallyFulfilledBy, nullIfNilString(order.LabelMessages), syncDate,
 			)
 			pageOrderCount++
@@ -792,11 +900,14 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
 	totalSynced := 0
 	syncErrors := []SyncError{}
 
-	modifyDateStart := time.Now().AddDate(0, 0, -14).Format("2006-01-02 15:04:05")
+	// Change date format from "2006-01-02 15:04:05" to "2006-01-02"
+	modifyDateStart := time.Now().AddDate(0, 0, -14).Format("2006-01-02")
 	log.Printf("Starting ShipStation shipment sync (modified since %s)...", modifyDateStart)
 
 	for {
-		reqURL := fmt.Sprintf("%s?page=%d&pageSize=500&sortBy=ModifyDate&sortDir=ASC&modifyDateStart=%s", baseURL, page, modifyDateStart)
+		// Reduce page size from 500 to 100 and properly encode parameters
+		reqURL := fmt.Sprintf("%s?page=%d&pageSize=100&sortBy=ModifyDate&sortDir=ASC&modifyDateStart=%s",
+			baseURL, page, url.QueryEscape(modifyDateStart))
 		req, err := http.NewRequest("GET", reqURL, nil)
 		if err != nil {
 			return fmt.Errorf("error creating shipment request page %d: %w", page, err)
@@ -822,11 +933,27 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
 			return fmt.Errorf("error reading shipment response page %d: %w", page, err)
 		}
 
+		// Add detailed logging before JSON unmarshaling
+		log.Printf("Raw ShipStation shipments API response (page %d): %s", page, string(body))
+
 		var shipmentsResp ShipmentsResponse
 		if err := json.Unmarshal(body, &shipmentsResp); err != nil {
-			log.Printf("Error parsing ShipStation shipments page %d: %v. Body: %s", page, err, string(body))
+			// Enhanced error logging with more details about the error
+			log.Printf("ERROR parsing ShipStation shipments page %d: %v", page, err)
+			log.Printf("JSON unmarshal error details: %s", err.Error())
+
+			// Try to unmarshal the response to a generic structure to see what was returned
+			var genericResp map[string]interface{}
+			if jsonErr := json.Unmarshal(body, &genericResp); jsonErr == nil {
+				log.Printf("Shipments response structure: %+v", genericResp)
+			}
+
 			return fmt.Errorf("error parsing shipments response page %d: %w", page, err)
 		}
+
+		// Add logging after successful unmarshaling
+		log.Printf("Successfully parsed ShipStation shipments response for page %d: %d shipments",
+			page, len(shipmentsResp.Shipments))
 
 		log.Printf("Processing shipment page %d/%d, %d shipments on page, %d total.",
 			shipmentsResp.Page, shipmentsResp.Pages, len(shipmentsResp.Shipments), shipmentsResp.Total)
@@ -876,9 +1003,9 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
                    OR shipstation_sync_shipments.voided IS DISTINCT FROM EXCLUDED.voided
                    OR shipstation_sync_shipments.sync_date != EXCLUDED.sync_date
 			`,
-				shipment.ShipmentID, shipment.OrderID, shipment.OrderKey, nullIfNilString(shipment.UserID), shipment.CustomerEmail, shipment.OrderNumber, shipment.CreateDate, shipment.ShipDate, shipment.ShipmentCost,
+				shipment.ShipmentID, shipment.OrderID, shipment.OrderKey, nullIfNilString(shipment.UserID), shipment.CustomerEmail, shipment.OrderNumber, shipment.CreateDate.Time(), shipment.ShipDate.Time(), shipment.ShipmentCost,
 				shipment.InsuranceCost, shipment.TrackingNumber, shipment.IsReturnLabel, nullIfNilString(shipment.BatchNumber), shipment.CarrierCode, shipment.ServiceCode, shipment.PackageCode,
-				shipment.Confirmation, nullIfNilInt(shipment.WarehouseID), shipment.Voided, nullIfZeroTimePtr(shipment.VoidDate), shipment.MarketplaceNotified, nullIfNilString(shipment.NotifyErrorMessage), shipToJSON,
+				shipment.Confirmation, nullIfNilInt(shipment.WarehouseID), shipment.Voided, nullIfZeroShipStationTimePtr(shipment.VoidDate), shipment.MarketplaceNotified, nullIfNilString(shipment.NotifyErrorMessage), shipToJSON,
 				weightJSON, dimensionsJSON, insuranceOptionsJSON, advancedOptionsJSON, shipmentItemsJSON, syncDate,
 			)
 			pageShipmentCount++
