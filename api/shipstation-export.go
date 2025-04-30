@@ -233,7 +233,7 @@ type AdvancedOptions struct {
 	BillToAccount        string  `json:"billToAccount"`
 	BillToPostalCode     string  `json:"billToPostalCode"`
 	BillToCountryCode    string  `json:"billToCountryCode"`
-	BillToMyOtherAccount *bool   `json:"billToMyOtherAccount"` // Pointer for potential null boolean
+	BillToMyOtherAccount *int64  `json:"billToMyOtherAccount"` // Changed from *bool to *int64
 }
 
 // Option represents an item option
