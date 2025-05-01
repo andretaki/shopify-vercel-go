@@ -101,13 +101,13 @@ GET /api/shopify-export?type=<entity_type>
 ### ShipStation Export
 
 ```
-GET /api/shipstation-export"
+GET /api/shipstation-export
 ```
 
 Fetches and stores ShipStation order data.
 
 ```
-GET /api/shipstation-data"
+GET /api/shipstation-data
 ```
 
 Fetches and stores additional ShipStation data (shipments, carriers, warehouses, stores).

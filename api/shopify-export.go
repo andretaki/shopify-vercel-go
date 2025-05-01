@@ -89,12 +89,24 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	w.Header().Set("Content-Type", "application/json")
 
+	// New: Check for status or reset query parameters
+	isStatusRequest := r.URL.Query().Get("status") == "true"
+	isResetRequest := r.URL.Query().Get("reset") == "true"
+
 	syncType := r.URL.Query().Get("type")
 	if syncType == "" {
 		syncType = "all"
 	}
 	today := time.Now().Format("2006-01-02")
-	log.Printf("Starting Shopify export at %s for type: %s\n", startTime.Format(time.RFC3339), syncType)
+
+	// Log different message based on request type
+	if isStatusRequest {
+		log.Printf("Processing Shopify sync status request at %s\n", startTime.Format(time.RFC3339))
+	} else if isResetRequest {
+		log.Printf("Processing Shopify sync reset request at %s\n", startTime.Format(time.RFC3339))
+	} else {
+		log.Printf("Starting Shopify export at %s for type: %s\n", startTime.Format(time.RFC3339), syncType)
+	}
 
 	ctx := context.Background()
 	dbURL := os.Getenv("DATABASE_URL")
@@ -106,23 +118,26 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shopifyStore := os.Getenv("SHOPIFY_STORE")
-	// Use our helper function to get the access token
-	_, err := getShopifyAccessToken()
-	if err != nil || shopifyStore == "" {
-		errorMsg := "Shopify credentials error: "
-		if shopifyStore == "" {
-			errorMsg += "SHOPIFY_STORE not set"
-		} else {
-			errorMsg += err.Error()
+	// Only check Shopify credentials for export/sync operations, not for status/reset
+	if !isStatusRequest && !isResetRequest {
+		shopifyStore := os.Getenv("SHOPIFY_STORE")
+		// Use our helper function to get the access token
+		_, err := getShopifyAccessToken()
+		if err != nil || shopifyStore == "" {
+			errorMsg := "Shopify credentials error: "
+			if shopifyStore == "" {
+				errorMsg += "SHOPIFY_STORE not set"
+			} else {
+				errorMsg += err.Error()
+			}
+			log.Printf("Error: %v\n", errorMsg)
+			respondWithError(w, http.StatusInternalServerError, errors.New(errorMsg))
+			SendSystemErrorNotification("Config Error", errorMsg)
+			return
 		}
-		log.Printf("Error: %v\n", errorMsg)
-		respondWithError(w, http.StatusInternalServerError, errors.New(errorMsg))
-		SendSystemErrorNotification("Config Error", errorMsg)
-		return
 	}
 
-	log.Println("Connecting to database for Shopify Sync...")
+	log.Println("Connecting to database...")
 	conn, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		log.Printf("Database connection error: %v\n", err)
@@ -133,6 +148,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(ctx)
 	log.Println("Database connection successful.")
 
+	// Initialize tables
 	log.Println("Initializing Shopify database tables...")
 	if err := initDatabaseTables(ctx, conn); err != nil {
 		log.Printf("Shopify database initialization error: %v\n", err)
@@ -142,6 +158,19 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println("Shopify database tables initialized successfully.")
 
+	// Handle status request
+	if isStatusRequest {
+		handleStatusRequest(ctx, conn, w)
+		return
+	}
+
+	// Handle reset request
+	if isResetRequest {
+		handleResetRequest(ctx, conn, w)
+		return
+	}
+
+	// Continue with regular sync operation
 	stats := make(map[string]int)
 	var syncErrors []SyncError
 
@@ -223,166 +252,78 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Finished Shopify export request (type: %s) in %v.", syncType, duration)
 }
 
-// initDatabaseTables (Shopify specific)
+// handleStatusRequest handles the status endpoint that shows current sync state
+func handleStatusRequest(ctx context.Context, conn *pgx.Conn, w http.ResponseWriter) {
+	states, err := getAllSyncStates(ctx, conn)
+	if err != nil {
+		log.Printf("Error getting sync states: %v", err)
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to get sync states: %w", err))
+		return
+	}
+
+	// Format states for the response
+	stateMap := make(map[string]interface{})
+	for _, state := range states {
+		stateInfo := map[string]interface{}{
+			"status":          state.Status,
+			"last_sync_start": state.LastSyncStartTime.Time.Format(time.RFC3339),
+			"last_sync_end":   state.LastSyncEndTime.Time.Format(time.RFC3339),
+			"last_processed":  state.LastProcessedCount,
+			"total_processed": state.TotalProcessedCount,
+		}
+
+		// Only include error if there is one
+		if state.LastError.Valid {
+			stateInfo["error"] = state.LastError.String
+		}
+
+		stateMap[state.EntityType] = stateInfo
+	}
+
+	// Prepare response
+	syncCompleted, _ := checkAllSyncsCompleted(ctx, conn)
+	response := Response{
+		Success: true,
+		Message: fmt.Sprintf("Shopify sync status as of %s. Overall sync status: %s",
+			time.Now().Format(time.RFC3339),
+			formatSyncStatus(syncCompleted)),
+		Stats: stateMap,
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// formatSyncStatus returns a human-readable sync status
+func formatSyncStatus(syncCompleted bool) string {
+	if syncCompleted {
+		return "Complete"
+	}
+	return "In Progress"
+}
+
+// handleResetRequest handles the reset endpoint that resets all sync states
+func handleResetRequest(ctx context.Context, conn *pgx.Conn, w http.ResponseWriter) {
+	err := resetAllSyncStates(ctx, conn)
+	if err != nil {
+		log.Printf("Error resetting sync states: %v", err)
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to reset sync states: %w", err))
+		return
+	}
+
+	response := Response{
+		Success: true,
+		Message: fmt.Sprintf("Successfully reset all Shopify sync states at %s", time.Now().Format(time.RFC3339)),
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// initDatabaseTables (Shopify specific - ADDED sync_state table)
 func initDatabaseTables(ctx context.Context, conn *pgx.Conn) error {
-	// Create products table
-	_, err := conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_sync_products (
-			id SERIAL PRIMARY KEY,
-			product_id BIGINT UNIQUE NOT NULL,
-			title TEXT,
-			description TEXT,
-			product_type TEXT,
-			vendor TEXT,
-			handle TEXT,
-			status TEXT,
-			tags TEXT,
-			published_at TIMESTAMPTZ,
-			created_at TIMESTAMPTZ,
-			updated_at TIMESTAMPTZ,
-			variants JSONB,
-			images JSONB,
-			options JSONB,
-			metafields JSONB,
-			sync_date DATE NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_shopify_products_updated_at ON shopify_sync_products(updated_at);
-		CREATE INDEX IF NOT EXISTS idx_shopify_products_handle ON shopify_sync_products(handle);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create products table: %w", err)
-	}
-
-	// Create customers table
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_sync_customers (
-			id SERIAL PRIMARY KEY,
-			customer_id BIGINT UNIQUE NOT NULL,
-			first_name TEXT,
-			last_name TEXT,
-			email TEXT,
-			phone TEXT,
-			verified_email BOOLEAN,
-			accepts_marketing BOOLEAN DEFAULT FALSE,
-			orders_count INTEGER,
-			state TEXT,
-			total_spent DECIMAL(12,2),
-			note TEXT,
-			addresses JSONB,
-			default_address JSONB,
-			tax_exemptions JSONB,
-			tax_exempt BOOLEAN,
-			tags TEXT,
-			created_at TIMESTAMPTZ,
-			updated_at TIMESTAMPTZ,
-			sync_date DATE NOT NULL
-		);
-        CREATE INDEX IF NOT EXISTS idx_shopify_customers_updated_at ON shopify_sync_customers(updated_at);
-		CREATE INDEX IF NOT EXISTS idx_shopify_customers_email ON shopify_sync_customers(email);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create customers table: %w", err)
-	}
-
-	// Create orders table
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_sync_orders (
-			id SERIAL PRIMARY KEY,
-			order_id BIGINT UNIQUE NOT NULL,
-			name TEXT,
-			order_number INTEGER,
-			customer_id BIGINT,
-			email TEXT,
-			phone TEXT,
-			financial_status TEXT,
-			fulfillment_status TEXT,
-			processed_at TIMESTAMPTZ,
-			currency TEXT,
-			total_price DECIMAL(12,2),
-			subtotal_price DECIMAL(12,2),
-			total_tax DECIMAL(12,2),
-			total_discounts DECIMAL(12,2),
-			total_shipping DECIMAL(12,2),
-			billing_address JSONB,
-			shipping_address JSONB,
-			line_items JSONB,
-			shipping_lines JSONB,
-			discount_applications JSONB,
-			note TEXT,
-			tags TEXT,
-			created_at TIMESTAMPTZ,
-			updated_at TIMESTAMPTZ,
-			sync_date DATE NOT NULL
-		);
-        CREATE INDEX IF NOT EXISTS idx_shopify_orders_updated_at ON shopify_sync_orders(updated_at);
-		CREATE INDEX IF NOT EXISTS idx_shopify_orders_customer_id ON shopify_sync_orders(customer_id);
-		CREATE INDEX IF NOT EXISTS idx_shopify_orders_processed_at ON shopify_sync_orders(processed_at);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create orders table: %w", err)
-	}
-
-	// Create collections table
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_sync_collections (
-			id SERIAL PRIMARY KEY,
-			collection_id BIGINT UNIQUE NOT NULL,
-			title TEXT,
-			handle TEXT,
-			description TEXT,
-			description_html TEXT,
-			products_count INT,
-			products JSONB,
-			rule_set JSONB,
-			sort_order TEXT,
-			published_at TIMESTAMPTZ,
-			template_suffix TEXT,
-			updated_at TIMESTAMPTZ,
-			sync_date DATE NOT NULL
-		);
-        CREATE INDEX IF NOT EXISTS idx_shopify_collections_updated_at ON shopify_sync_collections(updated_at);
-        CREATE INDEX IF NOT EXISTS idx_shopify_collections_handle ON shopify_sync_collections(handle);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create collections table: %w", err)
-	}
-
-	// Create blog articles table
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shopify_sync_blog_articles (
-			id SERIAL PRIMARY KEY,
-			blog_id BIGINT NOT NULL,
-			article_id BIGINT NOT NULL,
-			blog_title TEXT,
-			title TEXT,
-			author TEXT,
-			content TEXT,
-			content_html TEXT,
-			excerpt TEXT,
-			handle TEXT,
-			image JSONB,
-			tags TEXT,
-			seo JSONB,
-			status TEXT,
-			published_at TIMESTAMPTZ,
-			created_at TIMESTAMPTZ,
-			updated_at TIMESTAMPTZ,
-			comments_count INTEGER,
-			summary_html TEXT,
-			template_suffix TEXT,
-			sync_date DATE NOT NULL,
-			UNIQUE (blog_id, article_id)
-		);
-        CREATE INDEX IF NOT EXISTS idx_shopify_blog_articles_updated_at ON shopify_sync_blog_articles(updated_at);
-		CREATE INDEX IF NOT EXISTS idx_shopify_blog_articles_published_at ON shopify_sync_blog_articles(published_at);
-        CREATE INDEX IF NOT EXISTS idx_shopify_blog_articles_handle ON shopify_sync_blog_articles(handle);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create blog articles table: %w", err)
-	}
-
-	log.Println("All Shopify tables checked/created successfully.")
-	return nil
+	// Use the helper function from shopify-sync-helpers.go instead of duplicating the code
+	return initShopifySyncTables(ctx, conn)
 }
 
 // handleRateLimit (Shared)

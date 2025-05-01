@@ -7,8 +7,13 @@
   },
   "routes": [
     {
-      "src": "/api/database",
-      "dest": "/api/database.go?handler=DatabaseHandler"
+      "src": "/api/shopify-sync-status",
+      "dest": "/api/shopify-export.go?status=true"
+    },
+    {
+      "src": "/api/shopify-sync-reset",
+      "methods": ["POST","GET"],
+      "dest": "/api/shopify-export.go?reset=true"
     },
     {
       "src": "/api/shopify-export",
@@ -37,10 +42,6 @@
     }
   ],
   "crons": [
-    {
-      "path": "/api/shopify-export?type=all",
-      "schedule": "0 */2 * * *"
-    },
     {
       "path": "/api/shipstation-export",
       "schedule": "0 */6 * * *"
