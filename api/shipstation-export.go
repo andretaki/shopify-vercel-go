@@ -917,6 +917,17 @@ func saveOrders(ctx context.Context, conn *pgx.Conn, orders []ShipStationOrder, 
 				dbUserID = fmt.Sprintf("%v", v)
 			}
 
+			var customField1, customField2, customField3 *string
+			if order.AdvancedOptions.CustomField1 != nil {
+				customField1 = order.AdvancedOptions.CustomField1
+			}
+			if order.AdvancedOptions.CustomField2 != nil {
+				customField2 = order.AdvancedOptions.CustomField2
+			}
+			if order.AdvancedOptions.CustomField3 != nil {
+				customField3 = order.AdvancedOptions.CustomField3
+			}
+
 			batch.Queue(`
 				INSERT INTO shipstation_sync_orders (
 					order_id, order_number, order_key, order_date, create_date, modify_date, payment_date, ship_by_date,
@@ -924,11 +935,13 @@ func saveOrders(ctx context.Context, conn *pgx.Conn, orders []ShipStationOrder, 
 					amount_paid, tax_amount, shipping_amount, customer_notes, internal_notes, gift, gift_message, payment_method,
 					requested_shipping_service, carrier_code, service_code, package_code, confirmation, ship_date,
 					hold_until_date, weight, dimensions, insurance_options, international_options, advanced_options,
-					tag_ids, user_id, externally_fulfilled, externally_fulfilled_by, label_messages, sync_date
+					tag_ids, user_id, externally_fulfilled, externally_fulfilled_by, label_messages, sync_date,
+					custom_field1, custom_field2, custom_field3
 				) VALUES (
 					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
 					$21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38,
-					$39, $40, $41, $42
+					$39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56,
+					$57, $58, $59, $60
 				)
 				ON CONFLICT (order_id) DO UPDATE SET
 					order_number = EXCLUDED.order_number, order_key = EXCLUDED.order_key, order_date = EXCLUDED.order_date,
@@ -944,16 +957,18 @@ func saveOrders(ctx context.Context, conn *pgx.Conn, orders []ShipStationOrder, 
 					dimensions = EXCLUDED.dimensions, insurance_options = EXCLUDED.insurance_options, international_options = EXCLUDED.international_options,
 					advanced_options = EXCLUDED.advanced_options, tag_ids = EXCLUDED.tag_ids, user_id = EXCLUDED.user_id,
 					externally_fulfilled = EXCLUDED.externally_fulfilled, externally_fulfilled_by = EXCLUDED.externally_fulfilled_by,
-					label_messages = EXCLUDED.label_messages, sync_date = EXCLUDED.sync_date
+					label_messages = EXCLUDED.label_messages, sync_date = EXCLUDED.sync_date,
+					custom_field1 = EXCLUDED.custom_field1, custom_field2 = EXCLUDED.custom_field2, custom_field3 = EXCLUDED.custom_field3
 				WHERE shipstation_sync_orders.modify_date < EXCLUDED.modify_date
 				   OR shipstation_sync_orders.sync_date != EXCLUDED.sync_date
-			`,
+				`,
 				order.OrderID, order.OrderNumber, order.OrderKey, order.OrderDate.Time(), order.CreateDate.Time(), order.ModifyDate.Time(), order.PaymentDate.Time(), nullIfZeroShipStationTimePtr(order.ShipByDate),
 				order.OrderStatus, nullIfNilInt(order.CustomerID), order.CustomerUsername, order.CustomerEmail, billToJSON, shipToJSON, itemsJSON, order.OrderTotal,
 				order.AmountPaid, order.TaxAmount, order.ShippingAmount, order.CustomerNotes, order.InternalNotes, order.Gift, order.GiftMessage, order.PaymentMethod,
 				order.RequestedShippingService, order.CarrierCode, order.ServiceCode, order.PackageCode, order.Confirmation, nullIfZeroShipStationTimePtr(order.ShipDate),
 				nullIfZeroShipStationTimePtr(order.HoldUntilDate), weightJSON, dimensionsJSON, insuranceOptionsJSON, internationalOptionsJSON, advancedOptionsJSON,
 				tagIDsJSON, dbUserID, order.ExternallyFulfilled, order.ExternallyFulfilledBy, nullIfNilString(order.LabelMessages), syncDate,
+				customField1, customField2, customField3,
 			)
 		}
 
