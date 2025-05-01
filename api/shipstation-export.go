@@ -1,16 +1,16 @@
-// api/shipstation-export.go
+// api/shipstation-export-simplified.go
 package api
 
 import (
-	"bytes" // Added for request body cloning
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log" // Added standard log
+	"log"
 	"math"
 	"net/http"
-	"net/url" // Added for URL encoding
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -22,7 +22,6 @@ import (
 
 // --- ShipStation Custom Time Handling ---
 
-// ShipStationTime is a custom time type to handle various formats sent by ShipStation API
 type ShipStationTime time.Time
 
 // UnmarshalJSON implements custom unmarshaling for ShipStation's variable time formats
@@ -92,18 +91,18 @@ func (st ShipStationTime) Time() time.Time {
 	return time.Time(st)
 }
 
-// --- ShipStation Data Structures (Updated with custom time type) ---
+// --- ShipStation Data Structures (Simplified to just Orders and Shipments) ---
 
 // ShipStationOrder represents a ShipStation order
 type ShipStationOrder struct {
 	OrderID                  int64                `json:"orderId"`
 	OrderNumber              string               `json:"orderNumber"`
 	OrderKey                 string               `json:"orderKey"`
-	OrderDate                ShipStationTime      `json:"orderDate"`   // Using custom time type
-	CreateDate               ShipStationTime      `json:"createDate"`  // Using custom time type
-	ModifyDate               ShipStationTime      `json:"modifyDate"`  // Using custom time type
-	PaymentDate              ShipStationTime      `json:"paymentDate"` // Using custom time type
-	ShipByDate               *ShipStationTime     `json:"shipByDate"`  // Using custom time type
+	OrderDate                ShipStationTime      `json:"orderDate"`
+	CreateDate               ShipStationTime      `json:"createDate"`
+	ModifyDate               ShipStationTime      `json:"modifyDate"`
+	PaymentDate              ShipStationTime      `json:"paymentDate"`
+	ShipByDate               *ShipStationTime     `json:"shipByDate"`
 	OrderStatus              string               `json:"orderStatus"`
 	CustomerID               *int64               `json:"customerId"`
 	CustomerUsername         string               `json:"customerUsername"`
@@ -125,139 +124,21 @@ type ShipStationOrder struct {
 	ServiceCode              string               `json:"serviceCode"`
 	PackageCode              string               `json:"packageCode"`
 	Confirmation             string               `json:"confirmation"`
-	ShipDate                 *ShipStationTime     `json:"shipDate"`      // Using custom time type
-	HoldUntilDate            *ShipStationTime     `json:"holdUntilDate"` // Using custom time type
+	ShipDate                 *ShipStationTime     `json:"shipDate"`
+	HoldUntilDate            *ShipStationTime     `json:"holdUntilDate"`
 	Weight                   Weight               `json:"weight"`
 	Dimensions               *Dimensions          `json:"dimensions"`
 	InsuranceOptions         InsuranceOptions     `json:"insuranceOptions"`
 	InternationalOptions     InternationalOptions `json:"internationalOptions"`
 	AdvancedOptions          AdvancedOptions      `json:"advancedOptions"`
 	TagIDs                   []int                `json:"tagIds"`
-	UserID                   interface{}          `json:"userId"` // Changed from *int64 to interface{}
+	UserID                   interface{}          `json:"userId"`
 	ExternallyFulfilled      bool                 `json:"externallyFulfilled"`
 	ExternallyFulfilledBy    string               `json:"externallyFulfilledBy"`
 	LabelMessages            *string              `json:"labelMessages"`
 }
 
-// Address represents a shipping or billing address
-type Address struct {
-	Name            string `json:"name"`
-	Company         string `json:"company"`
-	Street1         string `json:"street1"`
-	Street2         string `json:"street2"`
-	Street3         string `json:"street3"`
-	City            string `json:"city"`
-	State           string `json:"state"`
-	PostalCode      string `json:"postalCode"`
-	Country         string `json:"country"`
-	Phone           string `json:"phone"`
-	Residential     *bool  `json:"residential"` // Use pointer for potentially null boolean
-	AddressVerified string `json:"addressVerified"`
-}
-
-// Item represents an order item
-type Item struct {
-	OrderItemID       int64           `json:"orderItemId"`
-	LineItemKey       string          `json:"lineItemKey"`
-	SKU               string          `json:"sku"`
-	Name              string          `json:"name"`
-	ImageURL          string          `json:"imageUrl"`
-	Weight            *Weight         `json:"weight"`
-	Quantity          int             `json:"quantity"`
-	UnitPrice         *float64        `json:"unitPrice"`
-	TaxAmount         *float64        `json:"taxAmount"`
-	ShippingAmount    *float64        `json:"shippingAmount"`
-	WarehouseLocation string          `json:"warehouseLocation"`
-	Options           []Option        `json:"options"`
-	ProductID         *int64          `json:"productId"`
-	FulfillmentSKU    string          `json:"fulfillmentSku"`
-	Adjustment        bool            `json:"adjustment"`
-	UPC               string          `json:"upc"`
-	CreateDate        ShipStationTime `json:"createDate"`
-	ModifyDate        ShipStationTime `json:"modifyDate"`
-}
-
-// Weight represents weight information
-type Weight struct {
-	Value float64 `json:"value"`
-	Units string  `json:"units"` // e.g., "pounds", "ounces"
-}
-
-// Dimensions represents package dimensions
-type Dimensions struct {
-	Length float64 `json:"length"`
-	Width  float64 `json:"width"`
-	Height float64 `json:"height"`
-	Units  string  `json:"units"` // e.g., "inches"
-}
-
-// InsuranceOptions represents insurance options
-type InsuranceOptions struct {
-	Provider       string  `json:"provider"`
-	InsureShipment bool    `json:"insureShipment"`
-	InsuredValue   float64 `json:"insuredValue"`
-}
-
-// InternationalOptions represents international shipping options
-type InternationalOptions struct {
-	Contents     string        `json:"contents"` // e.g., "merchandise", "documents"
-	CustomsItems []CustomsItem `json:"customsItems"`
-	NonDelivery  string        `json:"nonDelivery"` // e.g., "return_to_sender", "treat_as_abandoned"
-}
-
-// CustomsItem represents customs information for international shipments
-type CustomsItem struct {
-	CustomsItemID        interface{} `json:"customsItemId"` // Changed from string to interface{} to handle numeric values
-	Description          string      `json:"description"`
-	Quantity             int         `json:"quantity"`
-	Value                float64     `json:"value"`
-	HarmonizedTariffCode string      `json:"harmonizedTariffCode"`
-	CountryOfOrigin      string      `json:"countryOfOrigin"` // e.g., "US"
-}
-
-// AdvancedOptions represents advanced shipping options
-type AdvancedOptions struct {
-	WarehouseID      *int64 `json:"warehouseId"` // Pointer for potential null
-	NonMachinable    bool   `json:"nonMachinable"`
-	SaturdayDelivery bool   `json:"saturdayDelivery"`
-	ContainsAlcohol  bool   `json:"containsAlcohol"`
-	// MergedOrSplit seems less common directly on order, maybe shipment?
-	// MergedIDs            []int   `json:"mergedIds"`
-	// ParentID             *int64  `json:"parentId"`
-	StoreID              *int64      `json:"storeId"`      // Pointer for potential null
-	CustomField1         *string     `json:"customField1"` // Use pointers for potentially null custom fields
-	CustomField2         *string     `json:"customField2"`
-	CustomField3         *string     `json:"customField3"`
-	Source               string      `json:"source"`
-	BillToParty          string      `json:"billToParty"`
-	BillToAccount        string      `json:"billToAccount"`
-	BillToPostalCode     string      `json:"billToPostalCode"`
-	BillToCountryCode    string      `json:"billToCountryCode"`
-	BillToMyOtherAccount interface{} `json:"billToMyOtherAccount"` // Changed from *int64 to interface{}
-}
-
-// Option represents an item option
-type Option struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
-// ShipStationResponse represents the API response for listing orders
-type ShipStationResponse struct {
-	Orders []ShipStationOrder `json:"orders"`
-	Total  int                `json:"total"`
-	Page   int                `json:"page"`
-	Pages  int                `json:"pages"`
-}
-
-// ShipStationListResponse generic structure for list endpoints
-type ShipStationListResponse struct {
-	Total int `json:"total"`
-	Page  int `json:"page"`
-	Pages int `json:"pages"`
-}
-
-// ShipStationShipment represents a ShipStation shipment object
+// ShipStationShipment represents a ShipStation shipment
 type ShipStationShipment struct {
 	ShipmentID          int64            `json:"shipmentId"`
 	OrderID             int64            `json:"orderId"`
@@ -289,7 +170,98 @@ type ShipStationShipment struct {
 	ShipmentItems       []ShipmentItem   `json:"shipmentItems"`
 }
 
-// ShipmentItem represents an item within a shipment (similar to order item but might differ slightly)
+// Supporting types needed for orders and shipments
+type Address struct {
+	Name            string `json:"name"`
+	Company         string `json:"company"`
+	Street1         string `json:"street1"`
+	Street2         string `json:"street2"`
+	Street3         string `json:"street3"`
+	City            string `json:"city"`
+	State           string `json:"state"`
+	PostalCode      string `json:"postalCode"`
+	Country         string `json:"country"`
+	Phone           string `json:"phone"`
+	Residential     *bool  `json:"residential"`
+	AddressVerified string `json:"addressVerified"`
+}
+
+type Item struct {
+	OrderItemID       int64           `json:"orderItemId"`
+	LineItemKey       string          `json:"lineItemKey"`
+	SKU               string          `json:"sku"`
+	Name              string          `json:"name"`
+	ImageURL          string          `json:"imageUrl"`
+	Weight            *Weight         `json:"weight"`
+	Quantity          int             `json:"quantity"`
+	UnitPrice         *float64        `json:"unitPrice"`
+	TaxAmount         *float64        `json:"taxAmount"`
+	ShippingAmount    *float64        `json:"shippingAmount"`
+	WarehouseLocation string          `json:"warehouseLocation"`
+	Options           []Option        `json:"options"`
+	ProductID         *int64          `json:"productId"`
+	FulfillmentSKU    string          `json:"fulfillmentSku"`
+	Adjustment        bool            `json:"adjustment"`
+	UPC               string          `json:"upc"`
+	CreateDate        ShipStationTime `json:"createDate"`
+	ModifyDate        ShipStationTime `json:"modifyDate"`
+}
+
+type Weight struct {
+	Value float64 `json:"value"`
+	Units string  `json:"units"`
+}
+
+type Dimensions struct {
+	Length float64 `json:"length"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+	Units  string  `json:"units"`
+}
+
+type InsuranceOptions struct {
+	Provider       string  `json:"provider"`
+	InsureShipment bool    `json:"insureShipment"`
+	InsuredValue   float64 `json:"insuredValue"`
+}
+
+type InternationalOptions struct {
+	Contents     string        `json:"contents"`
+	CustomsItems []CustomsItem `json:"customsItems"`
+	NonDelivery  string        `json:"nonDelivery"`
+}
+
+type CustomsItem struct {
+	CustomsItemID        interface{} `json:"customsItemId"`
+	Description          string      `json:"description"`
+	Quantity             int         `json:"quantity"`
+	Value                float64     `json:"value"`
+	HarmonizedTariffCode string      `json:"harmonizedTariffCode"`
+	CountryOfOrigin      string      `json:"countryOfOrigin"`
+}
+
+type AdvancedOptions struct {
+	WarehouseID          *int64      `json:"warehouseId"`
+	NonMachinable        bool        `json:"nonMachinable"`
+	SaturdayDelivery     bool        `json:"saturdayDelivery"`
+	ContainsAlcohol      bool        `json:"containsAlcohol"`
+	StoreID              *int64      `json:"storeId"`
+	CustomField1         *string     `json:"customField1"`
+	CustomField2         *string     `json:"customField2"`
+	CustomField3         *string     `json:"customField3"`
+	Source               string      `json:"source"`
+	BillToParty          string      `json:"billToParty"`
+	BillToAccount        string      `json:"billToAccount"`
+	BillToPostalCode     string      `json:"billToPostalCode"`
+	BillToCountryCode    string      `json:"billToCountryCode"`
+	BillToMyOtherAccount interface{} `json:"billToMyOtherAccount"`
+}
+
+type Option struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type ShipmentItem struct {
 	OrderItemID       *int64   `json:"orderItemId"`
 	LineItemKey       string   `json:"lineItemKey"`
@@ -309,70 +281,19 @@ type ShipmentItem struct {
 	UPC               string   `json:"upc"`
 }
 
-// ShipmentsResponse structure for the /shipments endpoint response
+// Response structures for API
+type ShipStationResponse struct {
+	Orders []ShipStationOrder `json:"orders"`
+	Total  int                `json:"total"`
+	Page   int                `json:"page"`
+	Pages  int                `json:"pages"`
+}
+
 type ShipmentsResponse struct {
 	Shipments []ShipStationShipment `json:"shipments"`
 	Total     int                   `json:"total"`
 	Page      int                   `json:"page"`
 	Pages     int                   `json:"pages"`
-}
-
-// ShipStationCarrier represents a ShipStation carrier
-type ShipStationCarrier struct {
-	Name                  string           `json:"name"`
-	Code                  string           `json:"code"`
-	AccountNumber         string           `json:"accountNumber"`
-	RequiresFundedAccount bool             `json:"requiresFundedAccount"`
-	Balance               float64          `json:"balance"`
-	Nickname              string           `json:"nickname"`
-	ShippingProviderID    *int64           `json:"shippingProviderId"` // Can be null
-	Primary               bool             `json:"primary"`
-	Services              []CarrierService `json:"services"`
-	// CarrierID is not directly in the list response, might need separate call if PK needed
-	// SupportsLabelMessages seems deprecated/not standard
-	// HasMultiPackageSupportingServices seems deprecated/not standard
-}
-
-// CarrierService represents a carrier service
-type CarrierService struct {
-	CarrierID     *int64 `json:"carrierId"` // Might be null
-	Code          string `json:"code"`
-	Name          string `json:"name"`
-	Domestic      bool   `json:"domestic"`
-	International bool   `json:"international"`
-}
-
-// ShipStationWarehouse represents a ShipStation warehouse
-type ShipStationWarehouse struct {
-	WarehouseID   int64   `json:"warehouseId"`
-	WarehouseName string  `json:"warehouseName"` // Field name is warehouseName
-	OriginAddress Address `json:"originAddress"`
-	ReturnAddress Address `json:"returnAddress"`
-	IsDefault     bool    `json:"isDefault"`
-}
-
-// ShipStationStore represents a ShipStation store
-type ShipStationStore struct {
-	StoreID         int64           `json:"storeId"`
-	StoreName       string          `json:"storeName"` // Field name is storeName
-	MarketplaceName string          `json:"marketplaceName"`
-	MarketplaceID   int             `json:"marketplaceId"` // Usually int
-	AccountName     string          `json:"accountName"`
-	Email           string          `json:"email"`
-	IntegrationURL  *string         `json:"integrationUrl"` // Pointer for potential null
-	Active          bool            `json:"active"`
-	CompanyName     string          `json:"companyName"`
-	Phone           string          `json:"phone"`
-	PublicEmail     string          `json:"publicEmail"`
-	Website         string          `json:"website"`
-	StatusMappings  []StatusMapping `json:"statusMappings"` // Often null or empty
-	// Fields like createDate, modifyDate, refreshDate, lastFetchDate, autoRefresh are less common in list response
-}
-
-// StatusMapping represents a store status mapping (often empty/null)
-type StatusMapping struct {
-	OrderStatus string `json:"orderStatus"`
-	StatusKey   string `json:"statusKey"`
 }
 
 // --- Rate Limiter ---
@@ -429,8 +350,6 @@ func makeRequestWithRetry(client *http.Client, req *http.Request, rateLimiter *R
 		if req.Body != nil {
 			reqBodyBytes, readErr = ioutil.ReadAll(req.Body)
 			if readErr != nil {
-				// Log the error but allow the attempt to proceed with the original request's body
-				// This might fail later, but reading shouldn't prevent the attempt.
 				log.Printf("Warning: Failed to read request body for cloning on attempt %d: %v. Using original body.", attempt+1, readErr)
 				currentReq = req.Clone(context.Background()) // Clone without new body if read failed
 			} else {
@@ -615,73 +534,6 @@ func initShipStationTables(ctx context.Context, conn *pgx.Conn) error {
 	}
 	log.Println("Checked/Created shipstation_sync_shipments table.")
 
-	// Create carriers table with carrier_id as the unique key
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shipstation_sync_carriers (
-			id SERIAL PRIMARY KEY,
-			carrier_id BIGINT UNIQUE NOT NULL,
-			code TEXT,
-			name TEXT,
-			account_number TEXT,
-			requires_funded_account BOOLEAN,
-			balance DECIMAL(12,2),
-			nickname TEXT,
-			shipping_provider_id BIGINT,
-			primary_carrier BOOLEAN,
-			has_multi_package_support BOOLEAN,
-			supports_label_messages BOOLEAN,
-			services JSONB,
-			sync_date DATE NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_shipstation_carriers_name ON shipstation_sync_carriers(name);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create shipstation_sync_carriers table: %w", err)
-	}
-	log.Println("Checked/Created shipstation_sync_carriers table.")
-
-	// Create warehouses table
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shipstation_sync_warehouses (
-			id SERIAL PRIMARY KEY,
-			warehouse_id BIGINT UNIQUE NOT NULL,
-			warehouse_name TEXT,
-			origin_address JSONB,
-			return_address JSONB,
-			is_default BOOLEAN,
-			sync_date DATE NOT NULL
-		);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create shipstation_sync_warehouses table: %w", err)
-	}
-	log.Println("Checked/Created shipstation_sync_warehouses table.")
-
-	// Create stores table with 'name' field instead of 'store_name'
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS shipstation_sync_stores (
-			id SERIAL PRIMARY KEY,
-			store_id BIGINT UNIQUE NOT NULL,
-			name TEXT,
-			marketplace_name TEXT,
-			marketplace_id BIGINT,
-			create_date TIMESTAMPTZ,
-			modify_date TIMESTAMPTZ,
-			active BOOLEAN,
-			refresh_date TIMESTAMPTZ,
-			refresh_status TEXT,
-			last_fetch_date TIMESTAMPTZ,
-			auto_refresh BOOLEAN,
-			status_mappings JSONB,
-			sync_date DATE NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_shipstation_stores_marketplace_name ON shipstation_sync_stores(marketplace_name);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create shipstation_sync_stores table: %w", err)
-	}
-	log.Println("Checked/Created shipstation_sync_stores table.")
-
 	log.Println("ShipStation database tables initialization complete.")
 	return nil
 }
@@ -701,8 +553,6 @@ func nullIfZeroShipStationTimePtr(t *ShipStationTime) *time.Time {
 
 func nullIfNilInt(i *int64) *int64      { return i }
 func nullIfNilString(s *string) *string { return s }
-
-// --- END Helper Functions for Nullable Types ---
 
 // --- Sync Functions ---
 
@@ -855,10 +705,9 @@ func fetchOrdersPage(ctx context.Context, client *http.Client, baseURL, apiKey, 
 
 	var shipStationResp ShipStationResponse
 	if err := json.Unmarshal(body, &shipStationResp); err != nil {
-		return nil, fmt.Errorf("error parsing shipstation orders response for page %d: %w", page, err)
+		return nil, fmt.Errorf("error parsing shipstation orders response: %w", err)
 	}
 
-	log.Printf("Successfully parsed ShipStation response for page %d: %d orders", page, len(shipStationResp.Orders))
 	return shipStationResp.Orders, nil
 }
 
@@ -940,8 +789,7 @@ func saveOrders(ctx context.Context, conn *pgx.Conn, orders []ShipStationOrder, 
 				) VALUES (
 					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
 					$21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38,
-					$39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56,
-					$57, $58, $59, $60
+					$39, $40, $41, $42, $43, $44, $45
 				)
 				ON CONFLICT (order_id) DO UPDATE SET
 					order_number = EXCLUDED.order_number, order_key = EXCLUDED.order_key, order_date = EXCLUDED.order_date,
@@ -1018,7 +866,6 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
 
 	page := 1
 	totalSynced := 0
-	syncErrors := []SyncError{}
 
 	// Change date format from "2006-01-02 15:04:05" to "2006-01-02"
 	modifyDateStart := time.Now().AddDate(0, 0, -14).Format("2006-01-02")
@@ -1053,12 +900,8 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
 			return fmt.Errorf("error reading shipment response page %d: %w", page, err)
 		}
 
-		// Add detailed logging before JSON unmarshaling
-		log.Printf("Raw ShipStation shipments API response (page %d): %s", page, string(body))
-
 		var shipmentsResp ShipmentsResponse
 		if err := json.Unmarshal(body, &shipmentsResp); err != nil {
-			// Enhanced error logging with more details about the error
 			log.Printf("ERROR parsing ShipStation shipments page %d: %v", page, err)
 			log.Printf("JSON unmarshal error details: %s", err.Error())
 
@@ -1071,7 +914,6 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
 			return fmt.Errorf("error parsing shipments response page %d: %w", page, err)
 		}
 
-		// Add logging after successful unmarshaling
 		log.Printf("Successfully parsed ShipStation shipments response for page %d: %d shipments",
 			page, len(shipmentsResp.Shipments))
 
@@ -1220,405 +1062,6 @@ func syncShipments(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncD
 	}
 
 	log.Printf("Finished syncing ShipStation shipments. Total synced/updated: %d", totalSynced)
-	if len(syncErrors) > 0 {
-		log.Printf("Encountered %d non-fatal errors during shipment sync.", len(syncErrors))
-		return fmt.Errorf("completed shipment sync with %d errors: %v", len(syncErrors), syncErrors[0].Details)
-	}
-	return nil
-}
-
-// syncCarriers fetches and stores ShipStation carriers
-func syncCarriers(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncDate string) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	baseURL := "https://ssapi.shipstation.com/carriers"
-	rateLimiter := NewRateLimiter(35)
-
-	log.Println("Starting ShipStation carrier sync...")
-
-	req, err := http.NewRequest("GET", baseURL, nil)
-	if err != nil {
-		return fmt.Errorf("error creating carrier request: %w", err)
-	}
-
-	req.SetBasicAuth(apiKey, apiSecret)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := makeRequestWithRetry(client, req, rateLimiter)
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		return fmt.Errorf("error making carrier request: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("carriers API request failed status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading carrier response: %w", err)
-	}
-
-	var carriers []ShipStationCarrier
-	if err := json.Unmarshal(body, &carriers); err != nil {
-		log.Printf("Error parsing carriers response: %v. Body: %s", err, string(body))
-		return fmt.Errorf("error parsing carriers response: %w", err)
-	}
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin carrier tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// First, query to get existing carrier_ids mapped to codes
-	rows, err := conn.Query(ctx, `
-		SELECT carrier_id, code FROM shipstation_sync_carriers
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to query existing carriers: %w", err)
-	}
-	defer rows.Close()
-
-	// Map to store existing carrier IDs by code
-	carrierIDsByCode := make(map[string]int64)
-	for rows.Next() {
-		var id int64
-		var code string
-		if err := rows.Scan(&id, &code); err != nil {
-			log.Printf("Warning: Error scanning carrier row: %v", err)
-			continue
-		}
-		if code != "" {
-			carrierIDsByCode[code] = id
-		}
-	}
-
-	// Process carriers in batches
-	batch := &pgx.Batch{}
-	for i, carrier := range carriers {
-		// Generate a carrier ID if we don't have one
-		var carrierID int64
-		var found bool
-		if carrier.Code != "" {
-			carrierID, found = carrierIDsByCode[carrier.Code]
-		}
-		if !found {
-			// Generate a unique ID based on index (not ideal but works for this sync)
-			carrierID = int64(1000000 + i) // Start at a high number to avoid conflicts
-		}
-
-		servicesJSON, _ := json.Marshal(carrier.Services)
-
-		// Check for HasMultiPackageSupport and SupportsLabelMessages
-		hasMultiPackageSupport := false
-		supportsLabelMessages := false
-		for _, service := range carrier.Services {
-			// This is just a placeholder - in a real implementation you would determine
-			// these values based on actual service capabilities
-			if strings.Contains(strings.ToLower(service.Name), "multi") {
-				hasMultiPackageSupport = true
-			}
-			if strings.Contains(strings.ToLower(service.Name), "message") {
-				supportsLabelMessages = true
-			}
-		}
-
-		batch.Queue(`
-			INSERT INTO shipstation_sync_carriers (
-				carrier_id, code, name, account_number, requires_funded_account, 
-				balance, nickname, shipping_provider_id, primary_carrier, 
-				has_multi_package_support, supports_label_messages, services, sync_date
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT (carrier_id) DO UPDATE SET
-				code = EXCLUDED.code,
-				name = EXCLUDED.name, 
-				account_number = EXCLUDED.account_number,
-				requires_funded_account = EXCLUDED.requires_funded_account,
-				balance = EXCLUDED.balance,
-				nickname = EXCLUDED.nickname,
-				shipping_provider_id = EXCLUDED.shipping_provider_id,
-				primary_carrier = EXCLUDED.primary_carrier,
-				has_multi_package_support = EXCLUDED.has_multi_package_support,
-				supports_label_messages = EXCLUDED.supports_label_messages,
-				services = EXCLUDED.services,
-				sync_date = EXCLUDED.sync_date
-		`,
-			carrierID,
-			carrier.Code,
-			carrier.Name,
-			carrier.AccountNumber,
-			carrier.RequiresFundedAccount,
-			carrier.Balance,
-			carrier.Nickname,
-			nullIfNilInt(carrier.ShippingProviderID),
-			carrier.Primary,
-			hasMultiPackageSupport,
-			supportsLabelMessages,
-			servicesJSON,
-			syncDate,
-		)
-	}
-
-	br := tx.SendBatch(ctx, batch)
-	var batchErr error
-	for i := 0; i < batch.Len(); i++ {
-		_, err := br.Exec() // Correct use of Exec
-		if err != nil {
-			log.Printf("❌ Error processing carrier batch item %d: %v", i, err)
-			if batchErr == nil {
-				batchErr = fmt.Errorf("error item %d: %w", i, err)
-			}
-		}
-	}
-	closeErr := br.Close() // Check error on Close
-
-	if batchErr != nil {
-		_ = tx.Rollback(ctx)
-		return fmt.Errorf("batch exec failed for carriers: %w", batchErr)
-	}
-	if closeErr != nil {
-		_ = tx.Rollback(ctx)
-		return fmt.Errorf("batch close failed for carriers: %w", closeErr)
-	}
-
-	commitErr := tx.Commit(ctx)
-	if commitErr != nil {
-		log.Printf("Error committing transaction for carriers: %v", commitErr)
-		return fmt.Errorf("failed to commit carrier tx: %w", commitErr)
-	}
-
-	log.Printf("Successfully synced %d ShipStation carriers.", len(carriers))
-	return nil
-}
-
-// syncWarehouses fetches and stores ShipStation warehouses
-func syncWarehouses(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncDate string) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	baseURL := "https://ssapi.shipstation.com/warehouses"
-	rateLimiter := NewRateLimiter(35)
-
-	log.Println("Starting ShipStation warehouse sync...")
-
-	req, err := http.NewRequest("GET", baseURL, nil)
-	if err != nil {
-		return fmt.Errorf("error creating warehouse request: %w", err)
-	}
-
-	req.SetBasicAuth(apiKey, apiSecret)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := makeRequestWithRetry(client, req, rateLimiter)
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		return fmt.Errorf("error making warehouse request: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("warehouses API request failed status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading warehouse response: %w", err)
-	}
-
-	var warehouses []ShipStationWarehouse
-	if err := json.Unmarshal(body, &warehouses); err != nil {
-		log.Printf("Error parsing warehouses response: %v. Body: %s", err, string(body))
-		return fmt.Errorf("error parsing warehouses response: %w", err)
-	}
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin warehouse tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	batch := &pgx.Batch{}
-	for _, warehouse := range warehouses {
-		originAddressJSON, _ := json.Marshal(warehouse.OriginAddress)
-		returnAddressJSON, _ := json.Marshal(warehouse.ReturnAddress)
-
-		batch.Queue(`
-			INSERT INTO shipstation_sync_warehouses ( warehouse_id, warehouse_name, origin_address, return_address, is_default, sync_date )
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (warehouse_id) DO UPDATE SET
-				warehouse_name = EXCLUDED.warehouse_name, origin_address = EXCLUDED.origin_address, return_address = EXCLUDED.return_address, is_default = EXCLUDED.is_default, sync_date = EXCLUDED.sync_date
-		`,
-			warehouse.WarehouseID, warehouse.WarehouseName, originAddressJSON, returnAddressJSON, warehouse.IsDefault, syncDate,
-		)
-	}
-
-	br := tx.SendBatch(ctx, batch)
-	var batchErr error
-	for i := 0; i < batch.Len(); i++ {
-		_, err := br.Exec() // Correct use of Exec
-		if err != nil {
-			log.Printf("❌ Error processing warehouse batch item %d: %v", i, err)
-			if batchErr == nil {
-				batchErr = fmt.Errorf("error item %d: %w", i, err)
-			}
-		}
-	}
-	closeErr := br.Close() // Check error on Close
-
-	if batchErr != nil {
-		_ = tx.Rollback(ctx)
-		return fmt.Errorf("batch exec failed for warehouses: %w", batchErr)
-	}
-	if closeErr != nil {
-		_ = tx.Rollback(ctx)
-		return fmt.Errorf("batch close failed for warehouses: %w", closeErr)
-	}
-
-	commitErr := tx.Commit(ctx)
-	if commitErr != nil {
-		log.Printf("Error committing transaction for warehouses: %v", commitErr)
-		return fmt.Errorf("failed to commit warehouse tx: %w", commitErr)
-	}
-
-	log.Printf("Successfully synced %d ShipStation warehouses.", len(warehouses))
-	return nil
-}
-
-// syncStores fetches and stores ShipStation stores
-func syncStores(ctx context.Context, conn *pgx.Conn, apiKey, apiSecret, syncDate string) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	baseURL := "https://ssapi.shipstation.com/stores"
-	rateLimiter := NewRateLimiter(35)
-
-	log.Println("Starting ShipStation store sync...")
-
-	req, err := http.NewRequest("GET", baseURL, nil)
-	if err != nil {
-		return fmt.Errorf("error creating store request: %w", err)
-	}
-
-	req.SetBasicAuth(apiKey, apiSecret)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := makeRequestWithRetry(client, req, rateLimiter)
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		return fmt.Errorf("error making store request: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("stores API request failed status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading store response: %w", err)
-	}
-
-	var stores []ShipStationStore
-	if err := json.Unmarshal(body, &stores); err != nil {
-		log.Printf("Error parsing stores response: %v. Body: %s", err, string(body))
-		return fmt.Errorf("error parsing stores response: %w", err)
-	}
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin store tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	batch := &pgx.Batch{}
-	for _, store := range stores {
-		var statusMappingsJSON []byte = []byte("[]")
-		if store.StatusMappings != nil {
-			statusMappingsJSON, _ = json.Marshal(store.StatusMappings)
-		}
-
-		// Convert marketplaceId to bigint if needed
-		var marketplaceID int64 = int64(store.MarketplaceID)
-
-		// Use current time for any missing timestamps
-		currentTime := time.Now()
-		createDate := currentTime
-		modifyDate := currentTime
-		refreshDate := currentTime
-		lastFetchDate := currentTime
-
-		// Default values for fields not directly provided by API
-		refreshStatus := "unknown"
-		autoRefresh := false
-
-		batch.Queue(`
-			INSERT INTO shipstation_sync_stores (
-				store_id, name, marketplace_name, marketplace_id, 
-				create_date, modify_date, active, 
-				refresh_date, refresh_status, last_fetch_date, auto_refresh,
-				status_mappings, sync_date
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT (store_id) DO UPDATE SET
-				name = EXCLUDED.name,
-				marketplace_name = EXCLUDED.marketplace_name,
-				marketplace_id = EXCLUDED.marketplace_id,
-				create_date = EXCLUDED.create_date,
-				modify_date = EXCLUDED.modify_date,
-				active = EXCLUDED.active,
-				refresh_date = EXCLUDED.refresh_date,
-				refresh_status = EXCLUDED.refresh_status,
-				last_fetch_date = EXCLUDED.last_fetch_date,
-				auto_refresh = EXCLUDED.auto_refresh,
-				status_mappings = EXCLUDED.status_mappings,
-				sync_date = EXCLUDED.sync_date
-		`,
-			store.StoreID,
-			store.StoreName,
-			store.MarketplaceName,
-			marketplaceID,
-			createDate,
-			modifyDate,
-			store.Active,
-			refreshDate,
-			refreshStatus,
-			lastFetchDate,
-			autoRefresh,
-			statusMappingsJSON,
-			syncDate,
-		)
-	}
-
-	br := tx.SendBatch(ctx, batch)
-	var batchErr error
-	for i := 0; i < batch.Len(); i++ {
-		_, err := br.Exec() // Correct use of Exec
-		if err != nil {
-			log.Printf("❌ Error processing store batch item %d: %v", i, err)
-			if batchErr == nil {
-				batchErr = fmt.Errorf("error item %d: %w", i, err)
-			}
-		}
-	}
-	closeErr := br.Close() // Check error on Close
-
-	if batchErr != nil {
-		_ = tx.Rollback(ctx)
-		return fmt.Errorf("batch exec failed for stores: %w", batchErr)
-	}
-	if closeErr != nil {
-		_ = tx.Rollback(ctx)
-		return fmt.Errorf("batch close failed for stores: %w", closeErr)
-	}
-
-	commitErr := tx.Commit(ctx)
-	if commitErr != nil {
-		log.Printf("Error committing transaction for stores: %v", commitErr)
-		return fmt.Errorf("failed to commit store tx: %w", commitErr)
-	}
-
-	log.Printf("Successfully synced %d ShipStation stores.", len(stores))
 	return nil
 }
 
@@ -1670,11 +1113,11 @@ func ShipStationHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to sync ShipStation orders: %v", err)
 		log.Printf("Error: %s", errMsg)
-		response := Response{ // Use shared Response struct
+		response := Response{
 			Success: false,
 			Message: fmt.Sprintf("Completed ShipStation order export on %s with errors after %v.", today, duration.Round(time.Second)),
 			Stats:   stats,
-			Errors: []SyncError{{ // Use shared SyncError struct
+			Errors: []SyncError{{
 				Type:    "shipstation_orders",
 				Message: "Order sync failed",
 				Details: err.Error(),
@@ -1697,12 +1140,12 @@ func ShipStationHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Successfully completed ShipStation ORDER export in %v.", duration)
 }
 
-// ShipStationDataHandler handles requests to sync Shipments, Carriers, Warehouses, Stores.
+// ShipStationDataHandler handles requests to sync Shipments.
 func ShipStationDataHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	w.Header().Set("Content-Type", "application/json")
 	today := time.Now().Format("2006-01-02")
-	log.Printf("Starting ShipStation OTHER data export (Shipments, Carriers, etc.) at %s", startTime.Format(time.RFC3339))
+	log.Printf("Starting ShipStation SHIPMENT export at %s", startTime.Format(time.RFC3339))
 
 	ctx := context.Background()
 	dbURL := os.Getenv("DATABASE_URL")
@@ -1725,7 +1168,7 @@ func ShipStationDataHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close(ctx)
-	log.Println("Database connection successful for ShipStation Other Data Sync.")
+	log.Println("Database connection successful for ShipStation Shipment Sync.")
 
 	if err := initShipStationTables(ctx, conn); err != nil {
 		log.Printf("ShipStation table initialization error: %v", err)
@@ -1735,65 +1178,32 @@ func ShipStationDataHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println("ShipStation database tables initialized successfully.")
 
-	var syncErrors []SyncError // Collect errors
-
+	// Only sync shipments, removed other syncs
 	if err := syncShipments(ctx, conn, apiKey, apiSecret, today); err != nil {
 		errMsg := fmt.Sprintf("Failed to sync ShipStation shipments: %v", err)
 		log.Printf("Error: %s", errMsg)
-		syncErrors = append(syncErrors, SyncError{
-			Type: "shipstation_shipments", Message: "Shipment sync failed", Details: err.Error(),
-		})
-	} else {
-		log.Println("Shipment sync completed successfully.")
-	}
-
-	if err := syncCarriers(ctx, conn, apiKey, apiSecret, today); err != nil {
-		errMsg := fmt.Sprintf("Failed to sync ShipStation carriers: %v", err)
-		log.Printf("Error: %s", errMsg)
-		syncErrors = append(syncErrors, SyncError{
-			Type: "shipstation_carriers", Message: "Carrier sync failed", Details: err.Error(),
-		})
-	} else {
-		log.Println("Carrier sync completed successfully.")
-	}
-
-	if err := syncWarehouses(ctx, conn, apiKey, apiSecret, today); err != nil {
-		errMsg := fmt.Sprintf("Failed to sync ShipStation warehouses: %v", err)
-		log.Printf("Error: %s", errMsg)
-		syncErrors = append(syncErrors, SyncError{
-			Type: "shipstation_warehouses", Message: "Warehouse sync failed", Details: err.Error(),
-		})
-	} else {
-		log.Println("Warehouse sync completed successfully.")
-	}
-
-	if err := syncStores(ctx, conn, apiKey, apiSecret, today); err != nil {
-		errMsg := fmt.Sprintf("Failed to sync ShipStation stores: %v", err)
-		log.Printf("Error: %s", errMsg)
-		syncErrors = append(syncErrors, SyncError{
-			Type: "shipstation_stores", Message: "Store sync failed", Details: err.Error(),
-		})
-	} else {
-		log.Println("Store sync completed successfully.")
+		response := Response{
+			Success: false,
+			Message: fmt.Sprintf("Completed ShipStation shipment export on %s with errors after %v.", today, time.Since(startTime).Round(time.Second)),
+			Errors: []SyncError{{
+				Type:    "shipstation_shipments",
+				Message: "Shipment sync failed",
+				Details: err.Error(),
+			}},
+		}
+		_ = SendShipStationErrorNotification(response.Message, err.Error(), time.Since(startTime).Round(time.Second).String())
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(response)
+		return
 	}
 
 	duration := time.Since(startTime)
-	response := Response{ // Use shared Response struct
-		Success: len(syncErrors) == 0,
-		// Stats could be added here if sync functions returned counts
+	response := Response{
+		Success: true,
+		Message: fmt.Sprintf("Successfully exported ShipStation shipments on %s in %v.", today, duration.Round(time.Second)),
 	}
-
-	if len(syncErrors) > 0 {
-		response.Message = fmt.Sprintf("Completed ShipStation data export on %s with %d errors after %v.", today, len(syncErrors), duration.Round(time.Second))
-		response.Errors = syncErrors
-		_ = SendShipStationErrorNotification(response.Message, fmt.Sprintf("%+v", syncErrors), duration.Round(time.Second).String())
-		w.WriteHeader(http.StatusInternalServerError)
-	} else {
-		response.Message = fmt.Sprintf("Successfully exported ShipStation data (Shipments, Carriers, etc.) on %s in %v.", today, duration.Round(time.Second))
-		_ = SendShipStationSuccessNotification(response.Message, "All secondary data types synced successfully.", duration.Round(time.Second).String())
-		w.WriteHeader(http.StatusOK)
-	}
-
+	_ = SendShipStationSuccessNotification(response.Message, "Shipments synced successfully.", duration.Round(time.Second).String())
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
-	log.Printf("Successfully completed ShipStation OTHER data export in %v.", duration)
+	log.Printf("Successfully completed ShipStation SHIPMENT export in %v.", duration)
 }
