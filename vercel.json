@@ -3,7 +3,7 @@
   "functions": {
     "api/*.go": {
       "maxDuration": 60,
-      "runtime": "vercel-go@1.0.0",
+      "runtime": "go@1.28.4",
       "memory": 1024
     }
   },
