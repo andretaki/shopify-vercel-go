@@ -4,8 +4,7 @@
     "api/*.go": {
       "maxDuration": 60,
       "runtime": "go@1",
-      "memory": 1024,
-      "fluid": true
+      "memory": 1024
     }
   },
   "routes": [
