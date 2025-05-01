@@ -1,4 +1,5 @@
 // api/db.go
+// Export: DBFunctionHandler
 package api
 
 import (
