@@ -4,8 +4,11 @@ package api
 import (
 	"context"
 	"database/sql" // Use database/sql for nullable types
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -503,6 +506,71 @@ func MarkSyncFailed(ctx context.Context, conn *pgx.Conn, entityType string, fail
 	}
 	log.Printf("Marked sync state as 'failed' for %s", entityType)
 	return nil
+}
+
+// SyncHelperHandler is the Vercel serverless function handler for sync helper status
+func SyncHelperHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	ctx := context.Background()
+	dbURL := os.Getenv("DATABASE_URL")
+
+	if dbURL == "" {
+		err := fmt.Errorf("missing required DATABASE_URL environment variable")
+		log.Printf("Error: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		log.Printf("Database connection error: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to connect to database: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close(ctx)
+
+	states, err := getAllSyncStates(ctx, conn)
+	if err != nil {
+		log.Printf("Error retrieving sync states: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to retrieve sync states: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to simple map for JSON response
+	stateMap := make(map[string]map[string]interface{})
+	for _, state := range states {
+		stateInfo := map[string]interface{}{
+			"status":         state.Status,
+			"totalProcessed": state.TotalProcessedCount,
+			"lastProcessed":  state.LastProcessedCount,
+		}
+
+		if state.LastSyncStartTime.Valid {
+			stateInfo["startTime"] = state.LastSyncStartTime.Time.Format(time.RFC3339)
+		}
+
+		if state.LastSyncEndTime.Valid {
+			stateInfo["endTime"] = state.LastSyncEndTime.Time.Format(time.RFC3339)
+		}
+
+		if state.LastError.Valid {
+			stateInfo["error"] = state.LastError.String
+		}
+
+		stateMap[state.EntityType] = stateInfo
+	}
+
+	response := map[string]interface{}{
+		"status":     "ok",
+		"message":    "Shopify sync helper status",
+		"syncStates": stateMap,
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding response: %v", err)
+		http.Error(w, "Error generating response", http.StatusInternalServerError)
+	}
 }
 
 // --- Notification Helpers (Will be added in a later part) ---
