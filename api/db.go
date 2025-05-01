@@ -110,13 +110,5 @@ func DBHandler(w http.ResponseWriter, r *http.Request) {
 
 // DBFunctionHandler is the entry point for the Vercel function
 func DBFunctionHandler(w http.ResponseWriter, r *http.Request) {
-	handler := r.URL.Query().Get("handler")
-
-	switch handler {
-	case "DBHandler":
-		DBHandler(w, r)
-	default:
-		// Default to DBHandler if no handler specified
-		DBHandler(w, r)
-	}
+	DBHandler(w, r)
 }
