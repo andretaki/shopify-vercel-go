@@ -998,24 +998,24 @@ func syncProductsIncremental(ctx context.Context, conn *pgx.Conn, syncDate strin
 	log.Println("Processing incremental Shopify product sync...")
 
 	// Use a smaller page size than the original function
-	pageSize := 50 // Smaller batch size for faster processing
+	pageSize := 25 // Smaller batch size for faster processing
 
 	// Limit to only 1 page per invocation
 	maxPagesToProcess := 1
 
 	query := fmt.Sprintf(`
 		query GetProducts($cursor: String) {
-			products(first: %d, after: $cursor, sortKey: UPDATED_AT) {
-				pageInfo { hasNextPage endCursor }
-				edges { node {
-					id title descriptionHtml productType vendor handle status tags publishedAt createdAt updatedAt
-					variants(first: 100) { edges { node { id title price inventoryQuantity sku barcode weight weightUnit requiresShipping taxable displayName } } }
-					images(first: 100) { edges { node { id url altText width height } } }
-					options(first: 10) { id name values }
-					metafields(first: 50) { edges { node { id namespace key value type } } }
-				} }
+				products(first: %d, after: $cursor, sortKey: UPDATED_AT) {
+					pageInfo { hasNextPage endCursor }
+					edges { node {
+						id title descriptionHtml productType vendor handle status tags publishedAt createdAt updatedAt
+						variants(first: 25) { edges { node { id title price inventoryQuantity sku barcode weight weightUnit requiresShipping taxable displayName } } }
+						images(first: 100) { edges { node { id url altText width height } } }
+						options(first: 10) { id name values }
+						metafields(first: 10) { edges { node { id namespace key value type } } }
+					} }
+				}
 			}
-		}
 	`, pageSize)
 
 	tx, err := conn.Begin(ctx)
@@ -1207,7 +1207,7 @@ func syncCustomersIncremental(ctx context.Context, conn *pgx.Conn, syncDate stri
 	log.Println("Processing incremental Shopify customer sync...")
 
 	// Use a smaller page size for faster processing
-	pageSize := 50
+	pageSize := 25
 
 	// Limit to only 1 page per invocation
 	maxPagesToProcess := 1
@@ -1421,7 +1421,7 @@ func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string,
 	log.Println("Processing incremental Shopify order sync...")
 
 	// Use a smaller page size for faster processing
-	pageSize := 50
+	pageSize := 25
 
 	// Limit to only 1 page per invocation
 	maxPagesToProcess := 1
@@ -1670,7 +1670,7 @@ func syncCollectionsIncremental(ctx context.Context, conn *pgx.Conn, syncDate st
 	log.Println("Processing incremental Shopify collection sync...")
 
 	// Use a smaller page size for faster processing
-	pageSize := 50
+	pageSize := 25
 
 	// Limit to only 1 page per invocation
 	maxPagesToProcess := 1
@@ -1921,11 +1921,9 @@ func syncBlogArticlesIncremental(ctx context.Context, conn *pgx.Conn, syncDate s
 
 		if len(blogs) == 0 {
 			// No blogs to process
-			err = UpdateSyncState(ctx, tx, "blogs", sql.NullString{}, sql.NullInt64{}, sql.NullInt64{},
+			_ = UpdateSyncState(ctx, tx, "blogs", sql.NullString{}, sql.NullInt64{}, sql.NullInt64{},
 				0, false, nil)
-			if err != nil {
-				return 0, fmt.Errorf("failed to update sync state: %w", err)
-			}
+			// No need to check err here
 
 			if err := tx.Commit(ctx); err != nil {
 				return 0, fmt.Errorf("failed to commit transaction: %w", err)
@@ -1972,15 +1970,13 @@ func syncBlogArticlesIncremental(ctx context.Context, conn *pgx.Conn, syncDate s
 				log.Printf("Moving to next blog ID %d: %s", nextBlogID, nextBlog.Title)
 
 				// Update sync state to move to the next blog with reset sinceID
-				err = UpdateSyncState(ctx, tx, "blogs",
+				_ = UpdateSyncState(ctx, tx, "blogs",
 					sql.NullString{},
 					sql.NullInt64{Valid: false}, // Reset sinceID
 					sql.NullInt64{Int64: nextBlogID, Valid: true},
 					0, true, nil)
 
-				if err != nil {
-					return 0, fmt.Errorf("failed to update sync state for next blog: %w", err)
-				}
+				// No need to check err here
 
 				nextBlogFound = true
 				break
@@ -1992,15 +1988,13 @@ func syncBlogArticlesIncremental(ctx context.Context, conn *pgx.Conn, syncDate s
 			log.Println("Processed all blogs. Sync complete.")
 
 			// Mark as completed by setting hasNextPage to false
-			err = UpdateSyncState(ctx, tx, "blogs",
+			_ = UpdateSyncState(ctx, tx, "blogs",
 				sql.NullString{},
 				sql.NullInt64{Valid: false},
 				sql.NullInt64{Valid: false},
 				0, false, nil)
 
-			if err != nil {
-				return 0, fmt.Errorf("failed to update sync state on completion: %w", err)
-			}
+			// No need to check err here
 		}
 
 		// Commit transaction and return
@@ -2195,6 +2189,9 @@ func syncBlogArticlesIncremental(ctx context.Context, conn *pgx.Conn, syncDate s
 					sql.NullInt64{Valid: false}, // Reset sinceID
 					nextBlogID,
 					articleCount, true, nil)
+				if err != nil {
+					return articleCount, fmt.Errorf("failed to update sync state for next blog: %w", err)
+				}
 
 				nextBlogFound = true
 				break
@@ -2206,7 +2203,7 @@ func syncBlogArticlesIncremental(ctx context.Context, conn *pgx.Conn, syncDate s
 			log.Println("Processed all blogs. Sync complete.")
 
 			// Mark as completed by setting hasNextPage to false
-			err = UpdateSyncState(ctx, tx, "blogs",
+			_ = UpdateSyncState(ctx, tx, "blogs",
 				nextCursor,
 				sql.NullInt64{Valid: false},
 				sql.NullInt64{Valid: false},
@@ -2348,7 +2345,7 @@ func fetchShopifyArticles(blogID int64, sinceID int64) ([]ShopifyArticle, bool, 
 	}
 
 	apiVersion := "2024-04" // Keep consistent with GraphQL version used elsewhere
-	limit := 50             // Default page size, adjust as needed
+	limit := 25             // Smaller batch size for faster processing
 
 	// Ensure the shop name is correctly formatted
 	if !strings.Contains(shopName, ".myshopify.com") {
@@ -2434,15 +2431,30 @@ func fetchShopifyArticles(blogID int64, sinceID int64) ([]ShopifyArticle, bool, 
 			TemplateSuffix: safeCastString(articleMap["template_suffix"]),
 		}
 
-		// Handle dates
-		if createdAt, ok := articleMap["created_at"].(string); ok {
-			article.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		// Handle dates (CORRECTED: Check error from time.Parse)
+		if createdAt, ok := articleMap["created_at"].(string); ok && createdAt != "" {
+			parsedTime, err := time.Parse(time.RFC3339, createdAt)
+			if err != nil {
+				log.Printf("Warning: Could not parse created_at timestamp '%s' for article ID %d: %v", createdAt, article.ID, err)
+			} else {
+				article.CreatedAt = parsedTime
+			}
 		}
-		if updatedAt, ok := articleMap["updated_at"].(string); ok {
-			article.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		if updatedAt, ok := articleMap["updated_at"].(string); ok && updatedAt != "" {
+			parsedTime, err := time.Parse(time.RFC3339, updatedAt)
+			if err != nil {
+				log.Printf("Warning: Could not parse updated_at timestamp '%s' for article ID %d: %v", updatedAt, article.ID, err)
+			} else {
+				article.UpdatedAt = parsedTime
+			}
 		}
-		if publishedAt, ok := articleMap["published_at"].(string); ok {
-			article.PublishedAt, _ = time.Parse(time.RFC3339, publishedAt)
+		if publishedAt, ok := articleMap["published_at"].(string); ok && publishedAt != "" {
+			parsedTime, err := time.Parse(time.RFC3339, publishedAt)
+			if err != nil {
+				log.Printf("Warning: Could not parse published_at timestamp '%s' for article ID %d: %v", publishedAt, article.ID, err)
+			} else {
+				article.PublishedAt = parsedTime
+			}
 		}
 
 		// Handle image

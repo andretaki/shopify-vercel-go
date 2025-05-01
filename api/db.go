@@ -1,5 +1,5 @@
 // api/db.go
-// Export: DBFunctionHandler
+// Export: DBHandler
 package api
 
 import (
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,13 @@ func GetDBPool(ctx context.Context) (*pgxpool.Pool, error) {
 		if dbURL == "" {
 			poolError = fmt.Errorf("DATABASE_URL environment variable not set")
 			return
+		}
+
+		// Add pgbouncer and connect_timeout parameters
+		if !strings.Contains(dbURL, "?") {
+			dbURL += "?pgbouncer=true&connect_timeout=0"
+		} else {
+			dbURL += "&pgbouncer=true&connect_timeout=0"
 		}
 
 		config, err := pgxpool.ParseConfig(dbURL)
@@ -69,7 +77,7 @@ func AcquireConn(ctx context.Context) (*pgxpool.Conn, error) {
 	return conn, nil
 }
 
-// DBHandler checks database connection status
+// DBHandler checks database connection status (renamed from Handler)
 func DBHandler(w http.ResponseWriter, r *http.Request) {
 	type dbStatus struct {
 		Status  string `json:"status"`
@@ -106,9 +114,4 @@ func DBHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
-}
-
-// DBFunctionHandler is the entry point for the Vercel function
-func DBFunctionHandler(w http.ResponseWriter, r *http.Request) {
-	DBHandler(w, r)
 }

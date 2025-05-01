@@ -2,7 +2,10 @@
   "version": 2,
   "functions": {
     "api/*.go": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "runtime": "go@1",
+      "memory": 1024,
+      "fluid": true
     }
   },
   "routes": [
@@ -21,11 +24,7 @@
     },
     {
       "src": "/api/db-status",
-      "dest": "/api/db.go?export=DBFunctionHandler"
-    },
-    {
-      "src": "/api/db",
-      "dest": "/api/db/main.go"
+      "dest": "/api/db.go?export=DBHandler"
     },
     {
       "src": "/api/shipstation-export",
@@ -60,7 +59,7 @@
     },
     {
       "path": "/api/shopify-export",
-      "schedule": "*/2 * * * *"
+      "schedule": "*/5 * * * *"
     }
   ]
 }
