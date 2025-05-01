@@ -24,10 +24,6 @@
       "dest": "/api/db.go?export=DBFunctionHandler"
     },
     {
-      "src": "/api/db",
-      "dest": "/api/db/main.go"
-    },
-    {
       "src": "/api/shipstation-export",
       "dest": "/api/shipstation-export.go?handler=ShipStationHandler"
     },
