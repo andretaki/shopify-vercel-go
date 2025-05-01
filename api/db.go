@@ -68,8 +68,8 @@ func AcquireConn(ctx context.Context) (*pgxpool.Conn, error) {
 	return conn, nil
 }
 
-// Handler is required for Vercel serverless function support
-func Handler(w http.ResponseWriter, r *http.Request) {
+// DBHandler is required for Vercel serverless function support
+func DBHandler(w http.ResponseWriter, r *http.Request) {
 	type dbStatus struct {
 		Status  string `json:"status"`
 		Message string `json:"message"`
