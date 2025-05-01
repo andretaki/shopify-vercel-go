@@ -68,7 +68,7 @@ func AcquireConn(ctx context.Context) (*pgxpool.Conn, error) {
 	return conn, nil
 }
 
-// DBHandler is required for Vercel serverless function support
+// DBHandler checks database connection status
 func DBHandler(w http.ResponseWriter, r *http.Request) {
 	type dbStatus struct {
 		Status  string `json:"status"`
@@ -105,4 +105,17 @@ func DBHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// DBFunctionHandler is the entry point for the Vercel function
+func DBFunctionHandler(w http.ResponseWriter, r *http.Request) {
+	handler := r.URL.Query().Get("handler")
+
+	switch handler {
+	case "DBHandler":
+		DBHandler(w, r)
+	default:
+		// Default to DBHandler if no handler specified
+		DBHandler(w, r)
+	}
 }

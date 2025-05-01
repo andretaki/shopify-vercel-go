@@ -20,6 +20,10 @@
       "dest": "/api/shopify-export.go"
     },
     {
+      "src": "/api/db-status",
+      "dest": "/api/db.go?export=DBFunctionHandler"
+    },
+    {
       "src": "/api/shipstation-export",
       "dest": "/api/shipstation-export.go?handler=ShipStationHandler"
     },
