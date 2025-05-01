@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -23,6 +22,7 @@ type SyncState struct {
 	CurrentBlogID       sql.NullInt64  // Track current blog for article sync
 	LastSyncStartTime   sql.NullTime
 	LastSyncEndTime     sql.NullTime
+	LastProcessedTime   sql.NullTime
 	Status              string // 'pending', 'in_progress', 'completed', 'failed'
 	LastError           sql.NullString
 	LastProcessedCount  int
@@ -131,6 +131,7 @@ func initShopifySyncTables(ctx context.Context, conn *pgx.Conn) error {
 			current_blog_id BIGINT,               -- Track which blog is being processed for articles
 			last_sync_start_time TIMESTAMPTZ,     -- When the current cycle for this entity started
 			last_sync_end_time TIMESTAMPTZ,       -- When the last page/batch for this entity finished
+			last_processed_time TIMESTAMPTZ,      -- Timestamp of the most recent processing update
 			status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'in_progress', 'completed', 'failed'
 			last_error TEXT,                      -- Store details of the last error
 			last_processed_count INT DEFAULT 0,   -- Count from the last successful batch
@@ -168,13 +169,13 @@ func getSyncState(ctx context.Context, conn *pgx.Conn, entityType string) (*Sync
 	state := &SyncState{EntityType: entityType}
 	err := conn.QueryRow(ctx, `
 		SELECT last_cursor, last_rest_since_id, current_blog_id,
-		       last_sync_start_time, last_sync_end_time, status, last_error,
-		       last_processed_count, total_processed_count
+			   last_sync_start_time, last_sync_end_time, last_processed_time, status, last_error,
+			   last_processed_count, total_processed_count
 		FROM shopify_sync_state WHERE entity_type = $1
 	`, entityType).Scan(
 		&state.LastCursor, &state.LastRestSinceID, &state.CurrentBlogID,
-		&state.LastSyncStartTime, &state.LastSyncEndTime, &state.Status,
-		&state.LastError, &state.LastProcessedCount, &state.TotalProcessedCount,
+		&state.LastSyncStartTime, &state.LastSyncEndTime, &state.LastProcessedTime,
+		&state.Status, &state.LastError, &state.LastProcessedCount, &state.TotalProcessedCount,
 	)
 	if err != nil {
 		// If the table/row doesn't exist yet (e.g., first run), return a default pending state
@@ -247,6 +248,11 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 
 	// Conditionally update cursors/IDs based on status
 	if status == "in_progress" {
+		// Add more detailed progress tracking
+		setClauses = append(setClauses, fmt.Sprintf("last_processed_time = $%d", argIdx))
+		args = append(args, now)
+		argIdx++
+
 		setClauses = append(setClauses, fmt.Sprintf("last_cursor = $%d", argIdx))
 		args = append(args, nextCursor)
 		argIdx++
@@ -261,6 +267,11 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 		setClauses = append(setClauses, "last_cursor = NULL")
 		setClauses = append(setClauses, "last_rest_since_id = NULL")
 		setClauses = append(setClauses, "current_blog_id = NULL")
+
+		// Still update the last_processed_time on completion
+		setClauses = append(setClauses, fmt.Sprintf("last_processed_time = $%d", argIdx))
+		args = append(args, now)
+		argIdx++
 	}
 	// On 'failed' status, we intentionally don't update cursors/IDs
 
@@ -447,8 +458,8 @@ func checkAllSyncsCompleted(ctx context.Context, conn *pgx.Conn) (bool, error) {
 func getAllSyncStates(ctx context.Context, conn *pgx.Conn) ([]*SyncState, error) {
 	rows, err := conn.Query(ctx, `
 		SELECT entity_type, last_cursor, last_rest_since_id, current_blog_id,
-		       last_sync_start_time, last_sync_end_time, status, last_error,
-		       last_processed_count, total_processed_count
+			   last_sync_start_time, last_sync_end_time, last_processed_time, status, last_error,
+			   last_processed_count, total_processed_count
 		FROM shopify_sync_state ORDER BY entity_type
 	`)
 	if err != nil {
@@ -471,7 +482,7 @@ func getAllSyncStates(ctx context.Context, conn *pgx.Conn) ([]*SyncState, error)
 		state := &SyncState{}
 		err := rows.Scan(
 			&state.EntityType, &state.LastCursor, &state.LastRestSinceID, &state.CurrentBlogID,
-			&state.LastSyncStartTime, &state.LastSyncEndTime, &state.Status,
+			&state.LastSyncStartTime, &state.LastSyncEndTime, &state.LastProcessedTime, &state.Status,
 			&state.LastError, &state.LastProcessedCount, &state.TotalProcessedCount,
 		)
 		if err != nil {
@@ -511,25 +522,18 @@ func MarkSyncFailed(ctx context.Context, conn *pgx.Conn, entityType string, fail
 // SyncHelperHandler is the Vercel serverless function handler for sync helper status
 func SyncHelperHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
 	ctx := context.Background()
-	dbURL := os.Getenv("DATABASE_URL")
 
-	if dbURL == "" {
-		err := fmt.Errorf("missing required DATABASE_URL environment variable")
-		log.Printf("Error: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	conn, err := pgx.Connect(ctx, dbURL)
+	// Get connection from pool
+	poolConn, err := AcquireConn(ctx)
 	if err != nil {
 		log.Printf("Database connection error: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to connect to database: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to get database connection: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close(ctx)
+	defer poolConn.Release()
 
+	conn := poolConn.Conn()
 	states, err := getAllSyncStates(ctx, conn)
 	if err != nil {
 		log.Printf("Error retrieving sync states: %v", err)
@@ -552,6 +556,10 @@ func SyncHelperHandler(w http.ResponseWriter, r *http.Request) {
 
 		if state.LastSyncEndTime.Valid {
 			stateInfo["endTime"] = state.LastSyncEndTime.Time.Format(time.RFC3339)
+		}
+
+		if state.LastProcessedTime.Valid {
+			stateInfo["lastProcessedTime"] = state.LastProcessedTime.Time.Format(time.RFC3339)
 		}
 
 		if state.LastError.Valid {
