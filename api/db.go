@@ -3,7 +3,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -64,4 +66,43 @@ func AcquireConn(ctx context.Context) (*pgxpool.Conn, error) {
 	}
 
 	return conn, nil
+}
+
+// Handler is required for Vercel serverless function support
+func Handler(w http.ResponseWriter, r *http.Request) {
+	type dbStatus struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+
+	ctx := r.Context()
+	status := dbStatus{Status: "error", Message: "Unknown error"}
+
+	pool, err := GetDBPool(ctx)
+	if err != nil {
+		status.Message = fmt.Sprintf("Failed to get DB pool: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+	} else {
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			status.Message = fmt.Sprintf("Failed to acquire connection: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			defer conn.Release()
+
+			// Test connection with a simple query
+			var result int
+			err = conn.QueryRow(ctx, "SELECT 1").Scan(&result)
+			if err != nil {
+				status.Message = fmt.Sprintf("Database connection test failed: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+			} else {
+				status.Status = "ok"
+				status.Message = "Database connection successful"
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
