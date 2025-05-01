@@ -44,11 +44,15 @@
   "crons": [
     {
       "path": "/api/shipstation-export",
-      "schedule": "0 */6 * * *"
+      "schedule": "0 */10 * * * *"
     },
     {
       "path": "/api/shipstation-data",
-      "schedule": "0 */12 * * *"
+      "schedule": "0 */10 * * * *"
+    },
+    {
+      "path": "/api/shopify-export",
+      "schedule": "*/10 * * * *"
     }
   ]
 }

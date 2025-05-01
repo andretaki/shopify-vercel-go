@@ -756,9 +756,7 @@ func syncShipStationOrders(ctx context.Context, conn *pgx.Conn, apiKey, apiSecre
 
 	// Process first page results
 	ordersToSave := make([]ShipStationOrder, 0, len(initialResponse.Orders))
-	for _, order := range initialResponse.Orders {
-		ordersToSave = append(ordersToSave, order)
-	}
+	ordersToSave = append(ordersToSave, initialResponse.Orders...)
 
 	// Set up concurrency limits
 	maxConcurrentPages := 3 // Adjust this based on ShipStation rate limits
@@ -833,6 +831,9 @@ func fetchOrdersPage(ctx context.Context, client *http.Client, baseURL, apiKey, 
 
 	req.SetBasicAuth(apiKey, apiSecret)
 	req.Header.Set("Accept", "application/json")
+
+	// Use context with request
+	req = req.WithContext(ctx)
 
 	resp, err := makeRequestWithRetry(client, req, rateLimiter)
 	if resp != nil && resp.Body != nil {

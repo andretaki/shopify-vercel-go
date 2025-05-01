@@ -189,7 +189,7 @@ func getSyncState(ctx context.Context, conn *pgx.Conn, entityType string) (*Sync
 
 // updateSyncState updates the state after processing a batch.
 // This MUST be called within a database transaction `tx`.
-func updateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCursor sql.NullString, nextSinceID sql.NullInt64, nextBlogID sql.NullInt64, processedCount int, hasNextPage bool, cycleError error) error {
+func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCursor sql.NullString, nextSinceID sql.NullInt64, nextBlogID sql.NullInt64, processedCount int, hasNextPage bool, cycleError error) error {
 	now := time.Now()
 	var status string
 	var lastError sql.NullString
@@ -284,7 +284,7 @@ func updateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 }
 
 // findNextEntityTypeToProcess selects which entity to sync next based on status order.
-func findNextEntityTypeToProcess(ctx context.Context, conn *pgx.Conn) (string, *SyncState, error) {
+func FindNextEntityTypeToProcess(ctx context.Context, conn *pgx.Conn) (string, *SyncState, error) {
 	// 1. Check if any task is actively 'in_progress'
 	var inProgressEntityType string
 	err := conn.QueryRow(ctx, `SELECT entity_type FROM shopify_sync_state WHERE status = 'in_progress' LIMIT 1`).Scan(&inProgressEntityType)
@@ -337,7 +337,7 @@ func findNextEntityTypeToProcess(ctx context.Context, conn *pgx.Conn) (string, *
 // setSyncStateInProgress attempts to atomically claim an entity for processing.
 // It sets the status to 'in_progress' and resets cycle-specific fields if starting fresh.
 // Returns true if the lock was acquired, false otherwise.
-func setSyncStateInProgress(ctx context.Context, conn *pgx.Conn, entityType string, currentState *SyncState) (bool, error) {
+func SetSyncStateInProgress(ctx context.Context, conn *pgx.Conn, entityType string, currentState *SyncState) (bool, error) {
 	now := time.Now()
 	var resetTotalCount bool = false
 	var resetStartTime bool = false
@@ -484,7 +484,7 @@ func getAllSyncStates(ctx context.Context, conn *pgx.Conn) ([]*SyncState, error)
 }
 
 // markSyncFailed attempts to update the status to 'failed' for an entity, usually called outside the main processing transaction.
-func markSyncFailed(ctx context.Context, conn *pgx.Conn, entityType string, failureError error) error {
+func MarkSyncFailed(ctx context.Context, conn *pgx.Conn, entityType string, failureError error) error {
 	log.Printf("Attempting to mark %s as failed due to: %v", entityType, failureError)
 	now := time.Now()
 	lastError := sql.NullString{String: failureError.Error(), Valid: true}

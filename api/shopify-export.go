@@ -121,6 +121,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// Only check Shopify credentials for export/sync operations, not for status/reset
 	if !isStatusRequest && !isResetRequest {
 		shopifyStore := os.Getenv("SHOPIFY_STORE")
+
+		// **** ADDED DEBUG LOG ****
+		log.Printf("DEBUG: Checking Shopify credentials")
+		log.Printf("DEBUG: SHOPIFY_STORE: %s", shopifyStore)
+		log.Printf("DEBUG: SHOPIFY_ACCESS_TOKEN set: %t", os.Getenv("SHOPIFY_ACCESS_TOKEN") != "")
+		log.Printf("DEBUG: SHOPIFY_API_KEY set: %t", os.Getenv("SHOPIFY_API_KEY") != "")
+		log.Printf("DEBUG: SHOPIFY_API_SECRET set: %t", os.Getenv("SHOPIFY_API_SECRET") != "")
+		// **** END ADDED DEBUG LOG ****
+
 		// Use our helper function to get the access token
 		_, err := getShopifyAccessToken()
 		if err != nil || shopifyStore == "" {
@@ -372,8 +381,21 @@ func handleRateLimit(extensions map[string]interface{}) (time.Duration, error) {
 func getShopifyAccessToken() (string, error) {
 	// First check if an access token is already set (it's still valid to provide one directly)
 	if accessToken := os.Getenv("SHOPIFY_ACCESS_TOKEN"); accessToken != "" {
+		// **** ADDED DEBUG LOG ****
+		log.Printf("DEBUG: Using SHOPIFY_ACCESS_TOKEN from environment.")
+		// Mask most of the token for security in logs
+		maskedToken := accessToken
+		if len(maskedToken) > 10 {
+			maskedToken = maskedToken[:5] + "..." + maskedToken[len(maskedToken)-5:]
+		}
+		log.Printf("DEBUG: Token Value (masked): %s", maskedToken)
+		// **** END ADDED DEBUG LOG ****
 		return accessToken, nil
 	}
+
+	// **** ADDED DEBUG LOG ****
+	log.Printf("DEBUG: SHOPIFY_ACCESS_TOKEN not set, falling back to SHOPIFY_API_SECRET.")
+	// **** END ADDED DEBUG LOG ****
 
 	// If not, check for API key and secret
 	apiKey := os.Getenv("SHOPIFY_API_KEY")
@@ -386,6 +408,15 @@ func getShopifyAccessToken() (string, error) {
 
 	// For Admin API access, the access token is the API password/secret
 	// This is a common pattern for Shopify API authentication
+	// **** ADDED DEBUG LOG ****
+	log.Printf("DEBUG: Using SHOPIFY_API_SECRET as access token.")
+	// Mask most of the token for security in logs
+	maskedSecret := apiSecret
+	if len(maskedSecret) > 10 {
+		maskedSecret = maskedSecret[:5] + "..." + maskedSecret[len(maskedSecret)-5:]
+	}
+	log.Printf("DEBUG: Secret Value (masked): %s", maskedSecret)
+	// **** END ADDED DEBUG LOG ****
 	return apiSecret, nil
 }
 
@@ -408,6 +439,10 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 		shopName += ".myshopify.com"
 	}
 	graphqlURL = fmt.Sprintf("https://%s/admin/api/%s/graphql.json", shopName, apiVersion)
+
+	// **** ADDED DEBUG LOG ****
+	log.Printf("DEBUG: Using Shopify GraphQL URL: %s", graphqlURL)
+	// **** END ADDED DEBUG LOG ****
 
 	client := &http.Client{Timeout: 90 * time.Second} // Reasonable timeout
 	requestBody := GraphQLRequest{Query: query, Variables: variables}
@@ -442,6 +477,9 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 			return nil, fmt.Errorf("error creating request object (attempt %d): %w", attempt+1, err)
 		}
 
+		// **** ADDED DEBUG LOG ****
+		log.Printf("DEBUG: Setting X-Shopify-Access-Token header (token length: %d)", len(accessToken))
+		// **** END ADDED DEBUG LOG ****
 		req.Header.Set("X-Shopify-Access-Token", accessToken)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
@@ -468,6 +506,14 @@ func executeGraphQLQuery(query string, variables map[string]interface{}) (map[st
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("Attempt %d: Non-OK GraphQL Response Body: %s\n", attempt+1, string(bodyBytes))
 			detailedErrorMsg := parseGraphQLErrorMessage(bodyBytes)
+
+			// **** ADDED DEBUG LOG ****
+			if resp.StatusCode == http.StatusUnauthorized {
+				log.Printf("DEBUG: Authentication Error (401). Check SHOPIFY_ACCESS_TOKEN or SHOPIFY_API_SECRET.")
+				log.Printf("DEBUG: Response Headers: %+v", resp.Header)
+			}
+			// **** END ADDED DEBUG LOG ****
+
 			lastErr = fmt.Errorf("attempt %d: API request failed status %d: %s", attempt+1, resp.StatusCode, detailedErrorMsg)
 			log.Printf("Error: %v\n", lastErr)
 
@@ -2208,4 +2254,54 @@ func executeShopifyRequest(client *http.Client, req *http.Request) (*http.Respon
 
 	// If we exhausted all retries
 	return nil, fmt.Errorf("max retries (%d) exceeded for Shopify REST request: %w", maxRetries, lastErr)
+}
+
+// Define a separate handler for the sync status endpoint
+func SyncStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	w.Header().Set("Content-Type", "application/json")
+	log.Printf("Processing Shopify sync status request at %s\n", time.Now().Format(time.RFC3339))
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("DATABASE_URL environment variable not set"))
+		return
+	}
+
+	log.Println("Connecting to database...")
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		log.Printf("Database connection error: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to connect to database: %w", err))
+		return
+	}
+	defer conn.Close(ctx)
+	log.Println("Database connection successful.")
+
+	handleStatusRequest(ctx, conn, w)
+}
+
+// Define a separate handler for the sync reset endpoint
+func SyncResetHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	w.Header().Set("Content-Type", "application/json")
+	log.Printf("Processing Shopify sync reset request at %s\n", time.Now().Format(time.RFC3339))
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("DATABASE_URL environment variable not set"))
+		return
+	}
+
+	log.Println("Connecting to database...")
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		log.Printf("Database connection error: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to connect to database: %w", err))
+		return
+	}
+	defer conn.Close(ctx)
+	log.Println("Database connection successful.")
+
+	handleResetRequest(ctx, conn, w)
 }
