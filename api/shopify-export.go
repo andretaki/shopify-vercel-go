@@ -21,7 +21,8 @@ import (
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
-// --- Structs (GraphQLRequest, GraphQLResponse, Response, SyncError defined once, ideally in a shared file or here if not shared) ---
+// Add a constant for the time buffer before timeout
+const timeBufferBeforeTimeout = 15 * time.Second // Leave 15 seconds buffer
 
 // GraphQL query structure
 type GraphQLRequest struct {
@@ -173,25 +174,120 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// **** INCREMENTAL PROCESSING LOGIC BEGINS HERE ****
 
-	// IMPORTANT: Add timeout context to ensure we complete within Vercel's limits
-	processCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	// ----- BEGIN TIME GUARDING IMPLEMENTATION -----
+	// IMPORTANT: Add timeout context with 55 second limit (just under Vercel's 60-second limit)
+	const maxExecutionTime = 55 * time.Second
+	const maxBatchTime = 45 * time.Second             // Maximum time for batches to allow for cleanup
+	const timeBetweenBatches = 500 * time.Millisecond // Short pause between batches
+	const maxBatches = 5                              // Safeguard - process at most 5 batches per invocation
+
+	// Create a main timeout context
+	timeoutCtx, cancel := context.WithTimeout(ctx, maxExecutionTime)
 	defer cancel()
 
-	// Find next entity to process
-	entityType, state, err := FindNextEntityTypeToProcess(processCtx, conn.Conn())
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to find next entity to process: %w", err))
-		return
+	// Track overall stats for response
+	overallStats := map[string]interface{}{
+		"batches_processed":  0,
+		"total_records":      0,
+		"entities_processed": []string{},
+		"start_time":         startTime.Format(time.RFC3339),
 	}
 
-	// If nothing to process, return success with current status
-	if entityType == "" {
-		states, stateErr := getAllSyncStates(processCtx, conn.Conn())
-		if stateErr != nil {
-			respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to get sync states: %w", stateErr))
-			return
+	batchesDone := 0
+	timedOut := false
+
+	// Process batches until timeout or no more work
+	for batchesDone < maxBatches {
+		batchStart := time.Now()
+		log.Printf("Starting batch %d at %s", batchesDone+1, batchStart.Format(time.RFC3339))
+
+		// Check if we're approaching the timeout
+		timeElapsed := time.Since(startTime)
+		timeRemaining := maxExecutionTime - timeElapsed
+
+		if timeRemaining < 5*time.Second {
+			log.Printf("Time guard: Only %v remaining, stopping to allow graceful completion", timeRemaining)
+			timedOut = true
+			break
 		}
 
+		// Create a context for this batch with a timeout
+		batchTimeLimit := maxBatchTime
+		if timeRemaining < maxBatchTime {
+			batchTimeLimit = timeRemaining - (2 * time.Second) // Ensure 2 seconds for cleanup
+		}
+		batchCtx, batchCancel := context.WithTimeout(timeoutCtx, batchTimeLimit)
+
+		// Process a single entity
+		entityResult, processed := processSingleEntity(batchCtx, conn.Conn(), syncType, today)
+		batchCancel() // Release batch context
+
+		if !processed {
+			log.Println("No more entities to process in this invocation")
+			break // No entity was processed, so we're done
+		}
+
+		// Update stats
+		batchesDone++
+		overallStats["batches_processed"] = batchesDone
+
+		// Safely update total_records
+		totalRecords, ok := overallStats["total_records"].(int)
+		if !ok {
+			totalRecords = 0
+		}
+		overallStats["total_records"] = totalRecords + entityResult.ProcessedCount
+
+		// Add to list of processed entities if not already there
+		if entityResult.EntityType != "" {
+			entityList, ok := overallStats["entities_processed"].([]string)
+			if !ok {
+				entityList = []string{}
+			}
+
+			alreadyProcessed := false
+			for _, e := range entityList {
+				if e == entityResult.EntityType {
+					alreadyProcessed = true
+					break
+				}
+			}
+
+			if !alreadyProcessed {
+				entityList = append(entityList, entityResult.EntityType)
+				overallStats["entities_processed"] = entityList
+			}
+		}
+
+		log.Printf("Completed batch %d in %v (processed %d records of type %s)",
+			batchesDone, time.Since(batchStart), entityResult.ProcessedCount, entityResult.EntityType)
+
+		// Small pause between batches
+		select {
+		case <-timeoutCtx.Done():
+			log.Println("Main timeout context cancelled, stopping batch processing")
+			timedOut = true
+			break
+		case <-time.After(timeBetweenBatches):
+			// Continue with next batch
+		}
+
+		// Check if we're out of time
+		if timeoutCtx.Err() != nil {
+			log.Println("Timeout context expired, stopping batch processing")
+			timedOut = true
+			break
+		}
+	}
+
+	// Finalize stats
+	overallStats["total_duration"] = time.Since(startTime).String()
+	overallStats["timed_out"] = timedOut
+	overallStats["max_batches_reached"] = batchesDone >= maxBatches
+
+	// Get the current overall sync status
+	states, stateErr := getAllSyncStates(ctx, conn.Conn())
+	if stateErr == nil {
 		// Format states for response
 		stateMap := make(map[string]interface{})
 		for _, state := range states {
@@ -201,117 +297,100 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				"total_processed": state.TotalProcessedCount,
 			}
 		}
-
-		response := Response{
-			Success: true,
-			Message: "No entities currently need processing. All syncs complete or in progress.",
-			Stats:   stateMap,
-		}
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(response)
-		return
+		overallStats["entity_states"] = stateMap
 	}
 
-	// Filter by syncType if specified (and not "all")
-	if syncType != "all" && entityType != syncType {
-		response := Response{
-			Success: true,
-			Message: fmt.Sprintf("Skipping entity %s because type filter is set to %s", entityType, syncType),
-		}
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Try to claim this entity for processing
-	acquired, err := SetSyncStateInProgress(processCtx, conn.Conn(), entityType, state)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, fmt.Errorf("failed to set sync state: %w", err))
-		return
-	}
-
-	if !acquired {
-		// Someone else is already processing this entity
-		response := Response{
-			Success: true,
-			Message: fmt.Sprintf("Entity %s is already being processed by another instance", entityType),
-		}
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Process a small chunk of the entity
-	var processedCount int
-	var processErr error
-
-	switch entityType {
-	case "products":
-		processedCount, processErr = syncProductsIncremental(processCtx, conn.Conn(), today, state)
-	case "customers":
-		processedCount, processErr = syncCustomersIncremental(processCtx, conn.Conn(), today, state)
-	case "orders":
-		processedCount, processErr = syncOrdersIncremental(processCtx, conn.Conn(), today, state)
-	case "collections":
-		processedCount, processErr = syncCollectionsIncremental(processCtx, conn.Conn(), today, state)
-	case "blogs":
-		processedCount, processErr = syncBlogArticlesIncremental(processCtx, conn.Conn(), today, state)
-	default:
-		processErr = fmt.Errorf("unknown entity type: %s", entityType)
-	}
-
-	duration := time.Since(startTime)
-	if processErr != nil {
-		// Mark the sync as failed in the database
-		_ = MarkSyncFailed(ctx, conn.Conn(), entityType, processErr)
-
-		response := Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to process %s: %v", entityType, processErr),
-			Stats: map[string]interface{}{
-				"entity":   entityType,
-				"duration": duration.String(),
-			},
-			Errors: []SyncError{
-				{
-					Type:    "sync_" + entityType,
-					Message: fmt.Sprintf("Failed to process %s", entityType),
-					Details: processErr.Error(),
-				},
-			},
-		}
-
-		// Send notification
-		_ = SendShopifyErrorNotification(response.Message, processErr.Error(), duration.String())
-
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Check if all syncs are now completed
-	allCompleted, _ := checkAllSyncsCompleted(ctx, conn.Conn())
-	completionStatus := "in progress"
-	if allCompleted {
-		completionStatus = "complete"
-		// Send a completion notification if desired
-		// _ = SendShopifySuccessNotification("All Shopify syncs completed", "", duration.String())
-	}
-
-	// Success response
+	// Overall success response
 	response := Response{
 		Success: true,
-		Message: fmt.Sprintf("Successfully processed %d %s in %v", processedCount, entityType, duration),
-		Stats: map[string]interface{}{
-			"entity":         entityType,
-			"count":          processedCount,
-			"duration":       duration.String(),
-			"overall_status": completionStatus,
-		},
+		Message: fmt.Sprintf("Processed %d batches with %d total records in %v",
+			batchesDone, overallStats["total_records"], overallStats["total_duration"]),
+		Stats: overallStats,
 	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+	// ----- END TIME GUARDING IMPLEMENTATION -----
+}
+
+// EntityProcessResult represents the result of processing a single entity
+type EntityProcessResult struct {
+	EntityType     string
+	ProcessedCount int
+	Error          error
+	Duration       time.Duration
+}
+
+// processSingleEntity handles the processing of a single entity, returning the result
+// and a boolean indicating whether an entity was actually processed
+func processSingleEntity(ctx context.Context, conn *pgx.Conn, syncType, syncDate string) (EntityProcessResult, bool) {
+	result := EntityProcessResult{}
+
+	// Find next entity to process
+	entityType, state, err := FindNextEntityTypeToProcess(ctx, conn)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to find next entity to process: %w", err)
+		return result, false
+	}
+
+	// If nothing to process, return empty result
+	if entityType == "" {
+		return result, false // Nothing processed
+	}
+
+	// Filter by syncType if specified (and not "all")
+	if syncType != "all" && entityType != syncType {
+		log.Printf("Skipping entity %s because type filter is set to %s", entityType, syncType)
+		return result, false // Filtered out
+	}
+
+	// Try to claim this entity for processing
+	startTime := time.Now()
+	acquired, err := SetSyncStateInProgress(ctx, conn, entityType, state)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to set sync state: %w", err)
+		return result, false
+	}
+
+	if !acquired {
+		// Someone else is already processing this entity
+		log.Printf("Entity %s is already being processed by another instance", entityType)
+		return result, false // Already in progress
+	}
+
+	// Process a small chunk of the entity
+	result.EntityType = entityType
+	var processErr error
+
+	switch entityType {
+	case "products":
+		result.ProcessedCount, processErr = syncProductsIncremental(ctx, conn, syncDate, state)
+	case "customers":
+		result.ProcessedCount, processErr = syncCustomersIncremental(ctx, conn, syncDate, state)
+	case "orders":
+		result.ProcessedCount, processErr = syncOrdersIncremental(ctx, conn, syncDate, state)
+	case "collections":
+		result.ProcessedCount, processErr = syncCollectionsIncremental(ctx, conn, syncDate, state)
+	case "blogs":
+		result.ProcessedCount, processErr = syncBlogArticlesIncremental(ctx, conn, syncDate, state)
+	default:
+		processErr = fmt.Errorf("unknown entity type: %s", entityType)
+	}
+
+	result.Duration = time.Since(startTime)
+	result.Error = processErr
+
+	if processErr != nil {
+		// Mark the sync as failed in the database
+		_ = MarkSyncFailed(context.Background(), conn, entityType, processErr)
+		log.Printf("Failed to process %s: %v", entityType, processErr)
+		// Send notification
+		_ = SendShopifyErrorNotification(fmt.Sprintf("Failed to process %s", entityType), processErr.Error(), result.Duration.String())
+	} else {
+		log.Printf("Successfully processed %d %s in %v", result.ProcessedCount, entityType, result.Duration)
+	}
+
+	return result, true // Entity was processed
 }
 
 // handleStatusRequest handles the status endpoint that shows current sync state
@@ -993,15 +1072,11 @@ func extractMoneyValue(node map[string]interface{}, priceSetKey string) float64 
 
 // --- Shopify Sync Functions (with Batching) ---
 
-// syncProductsIncremental processes a small chunk of products using the provided sync state
+// syncProductsIncremental processes multiple chunks of products respecting context deadline.
 func syncProductsIncremental(ctx context.Context, conn *pgx.Conn, syncDate string, state *SyncState) (int, error) {
-	log.Println("Processing incremental Shopify product sync...")
+	log.Println("Processing incremental Shopify product sync with time guarding...")
 
-	// Use a smaller page size than the original function
-	pageSize := 25 // Smaller batch size for faster processing
-
-	// Limit to only 1 page per invocation
-	maxPagesToProcess := 1
+	pageSize := 25 // Keep batch size manageable
 
 	query := fmt.Sprintf(`
 		query GetProducts($cursor: String) {
@@ -1022,76 +1097,110 @@ func syncProductsIncremental(ctx context.Context, conn *pgx.Conn, syncDate strin
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin product transaction: %w", err)
 	}
-	defer tx.Rollback(ctx) // Ensure rollback on error
+	// Use defer for rollback, but Commit needs to be explicit on success path
+	defer tx.Rollback(ctx)
 
-	productCount := 0
+	totalProcessedThisInvocation := 0
 	pageCount := 0
+	hasNextPage := true            // Assume true initially or based on state
+	var currentCursor *string      // Renamed from 'cursor' to avoid conflict
+	var finalCursor sql.NullString // To store the cursor for the *next* invocation
 
-	// Get cursor from sync state if available
-	var cursor *string
+	// Initialize cursor from state
 	if state.LastCursor.Valid && state.LastCursor.String != "" {
 		cursorStr := state.LastCursor.String
-		cursor = &cursorStr
+		currentCursor = &cursorStr
+		finalCursor = state.LastCursor // Start with the current state's cursor
 	}
 
-	for pageCount < maxPagesToProcess {
+	// Loop until no more pages OR timeout approaches OR error occurs
+	for hasNextPage {
+		pageCount++
+		log.Printf("Product sync: Processing page %d", pageCount)
+
+		// --- TIME GUARD ---
+		deadline, ok := ctx.Deadline()
+		if ok { // Check if context has a deadline
+			remainingTime := time.Until(deadline)
+			log.Printf("Product sync: Time remaining: %v", remainingTime)
+			if remainingTime < timeBufferBeforeTimeout {
+				log.Printf("Product sync: Approaching timeout (%v remaining < %v buffer). Exiting loop.", remainingTime, timeBufferBeforeTimeout)
+				hasNextPage = true // Ensure we mark as in_progress since we stopped early
+				break              // Exit the loop gracefully
+			}
+		} else {
+			log.Printf("Product sync: Context has no deadline.")
+			// Optionally break after a certain number of pages if no deadline
+			// if pageCount > 10 { log.Println("Breaking loop after 10 pages due to no deadline"); break }
+		}
+		// --- END TIME GUARD ---
+
 		variables := map[string]interface{}{}
-		if cursor != nil {
-			variables["cursor"] = *cursor
+		if currentCursor != nil {
+			variables["cursor"] = *currentCursor
 		}
 
-		log.Printf("Fetching product page (cursor: %v)\n", cursor)
+		log.Printf("Fetching product page (cursor: %v)\n", currentCursor)
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
-			return productCount, fmt.Errorf("product graphql query failed: %w", err)
+			// Don't update state here, just return error. Rollback is deferred.
+			return totalProcessedThisInvocation, fmt.Errorf("product graphql query failed on page %d: %w", pageCount, err)
 		}
 
 		if data == nil {
-			log.Printf("Warning: Nil data map for products page.")
+			log.Printf("Warning: Nil data map received for products page %d.", pageCount)
+			hasNextPage = false                        // Assume no more data if map is nil
+			finalCursor = sql.NullString{Valid: false} // Reset cursor
 			break
 		}
 
 		productsData, ok := data["products"].(map[string]interface{})
 		if !ok || productsData == nil {
-			log.Printf("Warning: Invalid 'products' structure.")
+			log.Printf("Warning: Invalid 'products' structure on page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false} // Reset cursor
 			break
 		}
 
 		edges, _ := productsData["edges"].([]interface{})
 		pageInfo, piOK := productsData["pageInfo"].(map[string]interface{})
-		hasNextPage := piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		// Update hasNextPage based on current page's info
+		hasNextPage = piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		// Update finalCursor for the *next* potential iteration/invocation
+		if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
+			finalCursor = sql.NullString{String: endCursorVal, Valid: true}
+		} else {
+			// If no endCursor but hasNextPage is true, log warning, but keep existing finalCursor? Or clear it? Let's clear it.
+			if hasNextPage {
+				log.Printf("Warning: hasNextPage is true but endCursor is missing on product page %d.", pageCount)
+			}
+			finalCursor = sql.NullString{Valid: false}
+		}
 
 		if len(edges) == 0 {
-			log.Printf("Info: No products found on page.")
+			log.Printf("Info: No products found on page %d.", pageCount)
 			if !hasNextPage {
+				log.Println("No products and no next page indicated. Ending product sync.")
 				break // Exit loop if no edges and no next page
-			}
-
-			// If hasNextPage is true but no edges, update cursor and continue
-			if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
-				// Update sync state with new cursor
-				nextCursor := sql.NullString{String: endCursorVal, Valid: true}
-				err = UpdateSyncState(ctx, tx, "products", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-					0, hasNextPage, nil)
-				if err != nil {
-					return productCount, fmt.Errorf("failed to update sync state: %w", err)
-				}
-
-				// Commit transaction and exit
-				if err := tx.Commit(ctx); err != nil {
-					return productCount, fmt.Errorf("failed to commit product transaction: %w", err)
-				}
-				return 0, nil
 			} else {
-				log.Printf("Warning: hasNextPage is true but endCursor is missing on product page. Stopping.")
-				break
+				log.Println("No products but next page indicated. Continuing to update state with cursor.")
+				// Update cursor for next iteration even if this page was empty
+				currentCursor = nil
+				if finalCursor.Valid {
+					cursorStr := finalCursor.String
+					currentCursor = &cursorStr
+				}
+				continue // Skip DB processing, try next page
 			}
 		}
 
-		log.Printf("Processing %d products...\n", len(edges))
+		log.Printf("Processing %d products from page %d...\n", len(edges), pageCount)
 		batch := &pgx.Batch{}
 		pageProductCount := 0
 
+		// Process products in this page
 		for _, edge := range edges {
 			nodeMap, _ := edge.(map[string]interface{})
 			node, _ := nodeMap["node"].(map[string]interface{})
@@ -1131,86 +1240,84 @@ func syncProductsIncremental(ctx context.Context, conn *pgx.Conn, syncDate strin
 			metafieldsJSON := safeGetJSONB(node, "metafields") // Assumes metafields connection format
 
 			batch.Queue(`
-				INSERT INTO shopify_sync_products ( product_id, title, description, product_type, vendor, handle, status, tags, variants, images, options, metafields, published_at, created_at, updated_at, sync_date )
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-				ON CONFLICT (product_id) DO UPDATE SET
-					title = EXCLUDED.title, description = EXCLUDED.description, product_type = EXCLUDED.product_type, vendor = EXCLUDED.vendor, handle = EXCLUDED.handle, status = EXCLUDED.status, tags = EXCLUDED.tags, variants = EXCLUDED.variants, images = EXCLUDED.images, options = EXCLUDED.options, metafields = EXCLUDED.metafields, published_at = EXCLUDED.published_at, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at, sync_date = EXCLUDED.sync_date
-				WHERE shopify_sync_products.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR shopify_sync_products.sync_date != EXCLUDED.sync_date
-			`, productID, title, description, productType, vendor, handle, status, tagsString, variantsJSON, imagesJSON, optionsJSON, metafieldsJSON, publishedAt, createdAt, updatedAt, syncDate)
+					INSERT INTO shopify_sync_products ( product_id, title, description, product_type, vendor, handle, status, tags, variants, images, options, metafields, published_at, created_at, updated_at, sync_date )
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+					ON CONFLICT (product_id) DO UPDATE SET
+						title = EXCLUDED.title, description = EXCLUDED.description, product_type = EXCLUDED.product_type, vendor = EXCLUDED.vendor, handle = EXCLUDED.handle, status = EXCLUDED.status, tags = EXCLUDED.tags, variants = EXCLUDED.variants, images = EXCLUDED.images, options = EXCLUDED.options, metafields = EXCLUDED.metafields, published_at = EXCLUDED.published_at, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at, sync_date = EXCLUDED.sync_date
+					WHERE shopify_sync_products.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR shopify_sync_products.sync_date != EXCLUDED.sync_date
+				`, productID, title, description, productType, vendor, handle, status, tagsString, variantsJSON, imagesJSON, optionsJSON, metafieldsJSON, publishedAt, createdAt, updatedAt, syncDate)
 			pageProductCount++
 		}
 
+		// Execute the batch for this page
 		if batch.Len() > 0 {
 			br := tx.SendBatch(ctx, batch)
 			var batchErr error
 			for i := 0; i < batch.Len(); i++ {
 				_, err := br.Exec()
 				if err != nil {
-					log.Printf("❌ Error processing product batch item %d: %v", i+1, err)
-					// Capture the first error encountered in the batch
+					log.Printf("❌ Error processing product batch item %d (page %d): %v", i+1, pageCount, err)
 					if batchErr == nil {
 						batchErr = fmt.Errorf("error in product batch item %d: %w", i+1, err)
 					}
 				}
 			}
-			closeErr := br.Close() // Check for errors closing the batch results
+			closeErr := br.Close()
 			if batchErr != nil {
-				return productCount, fmt.Errorf("product batch execution failed: %w", batchErr)
+				// Don't update state, return error. Rollback is deferred.
+				return totalProcessedThisInvocation, fmt.Errorf("product batch execution failed page %d: %w", pageCount, batchErr)
 			}
 			if closeErr != nil {
-				return productCount, fmt.Errorf("product batch close failed: %w", closeErr)
+				// Don't update state, return error. Rollback is deferred.
+				return totalProcessedThisInvocation, fmt.Errorf("product batch close failed page %d: %w", pageCount, closeErr)
 			}
-			productCount += pageProductCount // Add successful count only after successful batch execution
-			log.Printf("Successfully processed batch for %d products.", pageProductCount)
+			totalProcessedThisInvocation += pageProductCount // Accumulate successful count
+			log.Printf("Successfully processed DB batch for %d products (page %d).", pageProductCount, pageCount)
 		} else {
-			log.Printf("No products queued for batch.")
+			log.Printf("No products queued for batch on page %d.", pageCount)
 		}
 
-		// Update the sync state within transaction
-		var nextCursor sql.NullString
-		if hasNextPage {
-			endCursorVal, ok := pageInfo["endCursor"].(string)
-			if ok && endCursorVal != "" {
-				nextCursor = sql.NullString{String: endCursorVal, Valid: true}
-			}
+		// Update cursor for the *next* iteration of the loop
+		currentCursor = nil // Reset before setting based on finalCursor
+		if finalCursor.Valid {
+			cursorStr := finalCursor.String
+			currentCursor = &cursorStr
 		}
 
-		err = UpdateSyncState(ctx, tx, "products", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-			pageProductCount, hasNextPage, nil)
-		if err != nil {
-			return productCount, fmt.Errorf("failed to update sync state: %w", err)
-		}
-
+		// If hasNextPage is false after processing this page's data, break the loop
 		if !hasNextPage {
-			break // Exit loop if no next page
+			log.Println("No next page indicated by pageInfo. Ending product sync loop.")
+			break
 		}
 
-		// Update cursor for next iteration
-		if nextCursor.Valid {
-			cursorStr := nextCursor.String
-			cursor = &cursorStr
-		}
+	} // End page processing loop
 
-		pageCount++
+	// --- Update Sync State *after* the loop ---
+	log.Printf("Product sync loop finished. Processed %d products total this invocation. Final hasNextPage: %t", totalProcessedThisInvocation, hasNextPage)
+
+	// Update the state based on the final status of hasNextPage and the final cursor
+	// Note: UpdateSyncState determines 'in_progress' or 'completed' based on hasNextPage
+	err = UpdateSyncState(ctx, tx, "products", finalCursor, sql.NullInt64{}, sql.NullInt64{},
+		totalProcessedThisInvocation, hasNextPage, nil) // Pass accumulated count
+	if err != nil {
+		// Rollback is deferred, just return the error
+		return totalProcessedThisInvocation, fmt.Errorf("failed to update final sync state for products: %w", err)
 	}
 
+	// --- Commit the transaction ---
 	if err := tx.Commit(ctx); err != nil {
-		return productCount, fmt.Errorf("failed to commit product transaction: %w", err)
+		return totalProcessedThisInvocation, fmt.Errorf("failed to commit final product transaction: %w", err)
 	}
 
-	log.Printf("✅ Successfully processed %d Shopify products incrementally.", productCount)
-	return productCount, nil
+	log.Printf("✅ Successfully processed %d Shopify products incrementally with time guarding.", totalProcessedThisInvocation)
+	return totalProcessedThisInvocation, nil // Return total count and nil error
 }
 
-// syncCustomersIncremental processes a small chunk of customers using the provided sync state
+// syncCustomersIncremental processes multiple chunks of customers respecting context deadline.
 func syncCustomersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string, state *SyncState) (int, error) {
-	log.Println("Processing incremental Shopify customer sync...")
+	log.Println("Processing incremental Shopify customer sync with time guarding...")
 
-	// Use a smaller page size for faster processing
-	pageSize := 25
-
-	// Limit to only 1 page per invocation
-	maxPagesToProcess := 1
+	pageSize := 25 // Keep batch size manageable
 
 	query := fmt.Sprintf(`
 		query GetCustomers($cursor: String) {
@@ -1233,71 +1340,98 @@ func syncCustomersIncremental(ctx context.Context, conn *pgx.Conn, syncDate stri
 	}
 	defer tx.Rollback(ctx)
 
-	customerCount := 0
+	totalProcessedThisInvocation := 0
 	pageCount := 0
+	hasNextPage := true // Assume true initially or based on state
+	var currentCursor *string
+	var finalCursor sql.NullString
 
-	// Get cursor from sync state if available
-	var cursor *string
+	// Initialize cursor from state
 	if state.LastCursor.Valid && state.LastCursor.String != "" {
 		cursorStr := state.LastCursor.String
-		cursor = &cursorStr
+		currentCursor = &cursorStr
+		finalCursor = state.LastCursor // Start with the current state's cursor
 	}
 
-	for pageCount < maxPagesToProcess {
+	// Loop until no more pages OR timeout approaches OR error occurs
+	for hasNextPage {
+		pageCount++
+		log.Printf("Customer sync: Processing page %d", pageCount)
+
+		// --- TIME GUARD ---
+		deadline, ok := ctx.Deadline()
+		if ok { // Check if context has a deadline
+			remainingTime := time.Until(deadline)
+			log.Printf("Customer sync: Time remaining: %v", remainingTime)
+			if remainingTime < timeBufferBeforeTimeout {
+				log.Printf("Customer sync: Approaching timeout (%v remaining < %v buffer). Exiting loop.", remainingTime, timeBufferBeforeTimeout)
+				hasNextPage = true // Ensure we mark as in_progress since we stopped early
+				break              // Exit the loop gracefully
+			}
+		} else {
+			log.Printf("Customer sync: Context has no deadline.")
+		}
+		// --- END TIME GUARD ---
+
 		variables := map[string]interface{}{}
-		if cursor != nil {
-			variables["cursor"] = *cursor
+		if currentCursor != nil {
+			variables["cursor"] = *currentCursor
 		}
 
-		log.Printf("Fetching customer page (cursor: %v)\n", cursor)
+		log.Printf("Fetching customer page (cursor: %v)\n", currentCursor)
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
-			return customerCount, fmt.Errorf("customer graphql query failed: %w", err)
+			return totalProcessedThisInvocation, fmt.Errorf("customer graphql query failed on page %d: %w", pageCount, err)
 		}
 
 		if data == nil {
-			log.Printf("Warning: Nil data map for customers page.")
+			log.Printf("Warning: Nil data map received for customers page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false}
 			break
 		}
 
 		customersData, ok := data["customers"].(map[string]interface{})
 		if !ok || customersData == nil {
-			log.Printf("Warning: Invalid 'customers' structure.")
+			log.Printf("Warning: Invalid 'customers' structure on page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false}
 			break
 		}
 
 		edges, _ := customersData["edges"].([]interface{})
 		pageInfo, piOK := customersData["pageInfo"].(map[string]interface{})
-		hasNextPage := piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		// Update hasNextPage based on current page's info
+		hasNextPage = piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		// Update finalCursor for the *next* potential iteration/invocation
+		if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
+			finalCursor = sql.NullString{String: endCursorVal, Valid: true}
+		} else {
+			if hasNextPage {
+				log.Printf("Warning: hasNextPage is true but endCursor is missing on customer page %d.", pageCount)
+			}
+			finalCursor = sql.NullString{Valid: false}
+		}
 
 		if len(edges) == 0 {
-			log.Printf("Info: No customers found on page.")
+			log.Printf("Info: No customers found on page %d.", pageCount)
 			if !hasNextPage {
-				break // Exit loop if no edges and no next page
-			}
-
-			// If hasNextPage is true but no edges, update cursor and continue
-			if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
-				// Update sync state with new cursor
-				nextCursor := sql.NullString{String: endCursorVal, Valid: true}
-				err = UpdateSyncState(ctx, tx, "customers", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-					0, hasNextPage, nil)
-				if err != nil {
-					return customerCount, fmt.Errorf("failed to update sync state: %w", err)
-				}
-
-				// Commit transaction and exit
-				if err := tx.Commit(ctx); err != nil {
-					return customerCount, fmt.Errorf("failed to commit customer transaction: %w", err)
-				}
-				return 0, nil
-			} else {
-				log.Printf("Warning: hasNextPage is true but endCursor is missing on customer page. Stopping.")
+				log.Println("No customers and no next page indicated. Ending customer sync.")
 				break
+			} else {
+				log.Println("No customers but next page indicated. Continuing to update state with cursor.")
+				currentCursor = nil
+				if finalCursor.Valid {
+					cursorStr := finalCursor.String
+					currentCursor = &cursorStr
+				}
+				continue
 			}
 		}
 
-		log.Printf("Processing %d customers...\n", len(edges))
+		log.Printf("Processing %d customers from page %d...\n", len(edges), pageCount)
 		batch := &pgx.Batch{}
 		pageCustomerCount := 0
 
@@ -1355,13 +1489,14 @@ func syncCustomersIncremental(ctx context.Context, conn *pgx.Conn, syncDate stri
 			pageCustomerCount++
 		}
 
+		// Execute the batch for this page
 		if batch.Len() > 0 {
 			br := tx.SendBatch(ctx, batch)
 			var batchErr error
 			for i := 0; i < batch.Len(); i++ {
 				_, err := br.Exec()
 				if err != nil {
-					log.Printf("❌ Error processing customer batch item %d: %v", i+1, err)
+					log.Printf("❌ Error processing customer batch item %d (page %d): %v", i+1, pageCount, err)
 					if batchErr == nil {
 						batchErr = fmt.Errorf("error in customer batch item %d: %w", i+1, err)
 					}
@@ -1369,91 +1504,67 @@ func syncCustomersIncremental(ctx context.Context, conn *pgx.Conn, syncDate stri
 			}
 			closeErr := br.Close()
 			if batchErr != nil {
-				return customerCount, fmt.Errorf("customer batch execution failed: %w", batchErr)
+				return totalProcessedThisInvocation, fmt.Errorf("customer batch execution failed on page %d: %w", pageCount, batchErr)
 			}
 			if closeErr != nil {
-				return customerCount, fmt.Errorf("customer batch close failed: %w", closeErr)
+				return totalProcessedThisInvocation, fmt.Errorf("customer batch close failed on page %d: %w", pageCount, closeErr)
 			}
-			customerCount += pageCustomerCount
-			log.Printf("Successfully processed batch for %d customers.", pageCustomerCount)
+			totalProcessedThisInvocation += pageCustomerCount
+			log.Printf("Successfully processed batch for %d customers (page %d).", pageCustomerCount, pageCount)
 		} else {
-			log.Printf("No customers queued for batch.")
+			log.Printf("No customers queued for batch on page %d.", pageCount)
 		}
 
-		// Update the sync state within transaction
-		var nextCursor sql.NullString
-		if hasNextPage {
-			endCursorVal, ok := pageInfo["endCursor"].(string)
-			if ok && endCursorVal != "" {
-				nextCursor = sql.NullString{String: endCursorVal, Valid: true}
-			}
-		}
-
-		err = UpdateSyncState(ctx, tx, "customers", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-			pageCustomerCount, hasNextPage, nil)
-		if err != nil {
-			return customerCount, fmt.Errorf("failed to update sync state: %w", err)
+		// Update cursor for the *next* iteration of the loop
+		currentCursor = nil
+		if finalCursor.Valid {
+			cursorStr := finalCursor.String
+			currentCursor = &cursorStr
 		}
 
 		if !hasNextPage {
-			break // Exit loop if no next page
+			log.Println("No next page indicated by pageInfo. Ending customer sync loop.")
+			break
 		}
-
-		// Update cursor for next iteration
-		if nextCursor.Valid {
-			cursorStr := nextCursor.String
-			cursor = &cursorStr
-		}
-
-		pageCount++
 	}
 
+	// --- Update Sync State *after* the loop ---
+	log.Printf("Customer sync loop finished. Processed %d customers total this invocation. Final hasNextPage: %t", totalProcessedThisInvocation, hasNextPage)
+
+	// Update the state based on the final status of hasNextPage and the final cursor
+	err = UpdateSyncState(ctx, tx, "customers", finalCursor, sql.NullInt64{}, sql.NullInt64{},
+		totalProcessedThisInvocation, hasNextPage, nil)
+	if err != nil {
+		return totalProcessedThisInvocation, fmt.Errorf("failed to update final sync state for customers: %w", err)
+	}
+
+	// Commit the transaction
 	if err := tx.Commit(ctx); err != nil {
-		return customerCount, fmt.Errorf("failed to commit customer transaction: %w", err)
+		return totalProcessedThisInvocation, fmt.Errorf("failed to commit final customer transaction: %w", err)
 	}
 
-	log.Printf("✅ Successfully processed %d Shopify customers incrementally.", customerCount)
-	return customerCount, nil
+	log.Printf("✅ Successfully processed %d Shopify customers incrementally with time guarding.", totalProcessedThisInvocation)
+	return totalProcessedThisInvocation, nil
 }
 
-// syncOrdersIncremental processes a small chunk of orders using the provided sync state
+// syncOrdersIncremental processes multiple chunks of orders respecting context deadline.
 func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string, state *SyncState) (int, error) {
-	log.Println("Processing incremental Shopify order sync...")
+	log.Println("Processing incremental Shopify order sync with time guarding...")
 
-	// Use a smaller page size for faster processing
-	pageSize := 25
+	pageSize := 25 // Keep batch size manageable
 
-	// Limit to only 1 page per invocation
-	maxPagesToProcess := 1
-
-	// CORRECTED QUERY v8: Reintroducing Price Sets
 	query := fmt.Sprintf(`
 		query GetOrders($cursor: String) {
 				orders(first: %d, after: $cursor, sortKey: UPDATED_AT) {
 					pageInfo { hasNextPage endCursor }
 					edges { node {
-						id
-						name
-						customer { id }
-						email
-						phone
-						displayFinancialStatus
-						displayFulfillmentStatus
-						processedAt
-						currencyCode
-						# --- Price Sets Re-added ---
-						totalPriceSet { shopMoney { amount } }
-						subtotalPriceSet { shopMoney { amount } }
-						totalTaxSet { shopMoney { amount } }
-						totalDiscountsSet { shopMoney { amount } }
-						totalShippingPriceSet { shopMoney { amount } }
-						note
-						tags
-						createdAt
-						updatedAt
-					} } # End node
-				} # End orders
-			} # End query
+						id name customer { id } email phone displayFinancialStatus displayFulfillmentStatus processedAt currencyCode
+						totalPriceSet { shopMoney { amount } } subtotalPriceSet { shopMoney { amount } } totalTaxSet { shopMoney { amount } }
+						totalDiscountsSet { shopMoney { amount } } totalShippingPriceSet { shopMoney { amount } }
+						note tags createdAt updatedAt
+					} }
+				}
+			}
 	`, pageSize)
 
 	tx, err := conn.Begin(ctx)
@@ -1462,71 +1573,98 @@ func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string,
 	}
 	defer tx.Rollback(ctx)
 
-	orderCount := 0
+	totalProcessedThisInvocation := 0
 	pageCount := 0
+	hasNextPage := true            // Assume true initially or based on state
+	var currentCursor *string      // For fetching the current page
+	var finalCursor sql.NullString // For the *next* invocation
 
-	// Get cursor from sync state if available
-	var cursor *string
+	// Initialize cursor from state
 	if state.LastCursor.Valid && state.LastCursor.String != "" {
 		cursorStr := state.LastCursor.String
-		cursor = &cursorStr
+		currentCursor = &cursorStr
+		finalCursor = state.LastCursor // Start with the current state's cursor
 	}
 
-	for pageCount < maxPagesToProcess {
+	// Loop until no more pages OR timeout approaches OR error occurs
+	for hasNextPage {
+		pageCount++
+		log.Printf("Order sync: Processing page %d", pageCount)
+
+		// --- TIME GUARD ---
+		deadline, ok := ctx.Deadline()
+		if ok { // Check if context has a deadline
+			remainingTime := time.Until(deadline)
+			log.Printf("Order sync: Time remaining: %v", remainingTime)
+			if remainingTime < timeBufferBeforeTimeout {
+				log.Printf("Order sync: Approaching timeout (%v remaining < %v buffer). Exiting loop.", remainingTime, timeBufferBeforeTimeout)
+				hasNextPage = true // Ensure we mark as in_progress since we stopped early
+				break              // Exit the loop gracefully
+			}
+		} else {
+			log.Printf("Order sync: Context has no deadline.")
+		}
+		// --- END TIME GUARD ---
+
 		variables := map[string]interface{}{}
-		if cursor != nil {
-			variables["cursor"] = *cursor
+		if currentCursor != nil {
+			variables["cursor"] = *currentCursor
 		}
 
-		log.Printf("Fetching order page (cursor: %v)\n", cursor)
+		log.Printf("Fetching order page (cursor: %v)\n", currentCursor)
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
-			return orderCount, fmt.Errorf("order graphql query failed: %w", err)
+			return totalProcessedThisInvocation, fmt.Errorf("order graphql query failed on page %d: %w", pageCount, err)
 		}
 
 		if data == nil {
-			log.Printf("Warning: Nil data map for orders page.")
+			log.Printf("Warning: Nil data map received for orders page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false}
 			break
 		}
 
 		ordersData, ok := data["orders"].(map[string]interface{})
 		if !ok || ordersData == nil {
-			log.Printf("Warning: Invalid 'orders' structure.")
+			log.Printf("Warning: Invalid 'orders' structure on page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false}
 			break
 		}
 
 		edges, _ := ordersData["edges"].([]interface{})
 		pageInfo, piOK := ordersData["pageInfo"].(map[string]interface{})
-		hasNextPage := piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		// Update hasNextPage based on current page's info
+		hasNextPage = piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		// Update finalCursor for the *next* potential iteration/invocation
+		if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
+			finalCursor = sql.NullString{String: endCursorVal, Valid: true}
+		} else {
+			if hasNextPage {
+				log.Printf("Warning: hasNextPage is true but endCursor is missing on order page %d.", pageCount)
+			}
+			finalCursor = sql.NullString{Valid: false}
+		}
 
 		if len(edges) == 0 {
-			log.Printf("Info: No orders found on page.")
+			log.Printf("Info: No orders found on page %d.", pageCount)
 			if !hasNextPage {
-				break // Exit loop if no edges and no next page
-			}
-
-			// If hasNextPage is true but no edges, update cursor and continue
-			if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
-				// Update sync state with new cursor
-				nextCursor := sql.NullString{String: endCursorVal, Valid: true}
-				err = UpdateSyncState(ctx, tx, "orders", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-					0, hasNextPage, nil)
-				if err != nil {
-					return orderCount, fmt.Errorf("failed to update sync state: %w", err)
-				}
-
-				// Commit transaction and exit
-				if err := tx.Commit(ctx); err != nil {
-					return orderCount, fmt.Errorf("failed to commit order transaction: %w", err)
-				}
-				return 0, nil
-			} else {
-				log.Printf("Warning: hasNextPage is true but endCursor is missing on order page. Stopping.")
+				log.Println("No orders and no next page indicated. Ending order sync.")
 				break
+			} else {
+				log.Println("No orders but next page indicated. Continuing to update state with cursor.")
+				currentCursor = nil
+				if finalCursor.Valid {
+					cursorStr := finalCursor.String
+					currentCursor = &cursorStr
+				}
+				continue
 			}
 		}
 
-		log.Printf("Processing %d orders...\n", len(edges))
+		log.Printf("Processing %d orders from page %d...\n", len(edges), pageCount)
 		batch := &pgx.Batch{}
 		pageOrderCount := 0
 
@@ -1547,7 +1685,7 @@ func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string,
 
 			// --- Extract fields ---
 			name := safeGetString(node, "name")
-			orderNumber := 0 // Set default for DB insert as orderNumber is removed from query
+			orderNumber := 0 // Default for DB insert
 			email := safeGetString(node, "email")
 			phone := safeGetString(node, "phone")
 			financialStatus := safeGetString(node, "displayFinancialStatus")
@@ -1563,20 +1701,17 @@ func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string,
 				customerID = extractIDFromGraphQLID(safeGetString(custNode, "id"))
 			}
 
-			// --- Extract Price Sets ---
 			totalPrice := extractMoneyValue(node, "totalPriceSet")
 			subtotalPrice := extractMoneyValue(node, "subtotalPriceSet")
 			totalTax := extractMoneyValue(node, "totalTaxSet")
 			totalDiscounts := extractMoneyValue(node, "totalDiscountsSet")
 			totalShipping := extractMoneyValue(node, "totalShippingPriceSet")
 
-			// --- Fields still NOT extracted (use defaults for DB) ---
-			var billingAddressJSON, shippingAddressJSON, lineItemsJSON, shippingLinesJSON, discountApplicationsJSON []byte
-			billingAddressJSON = []byte("null")
-			shippingAddressJSON = []byte("null")
-			lineItemsJSON = []byte("null")
-			shippingLinesJSON = []byte("null")
-			discountApplicationsJSON = []byte("null")
+			billingAddressJSON := []byte("null") // Simplified - not fetched
+			shippingAddressJSON := []byte("null")
+			lineItemsJSON := []byte("null")
+			shippingLinesJSON := []byte("null")
+			discountApplicationsJSON := []byte("null")
 
 			tagsVal, _ := node["tags"].([]interface{})
 			var tagsList []string
@@ -1587,44 +1722,39 @@ func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string,
 			}
 			tagsString := strings.Join(tagsList, ",")
 
-			// --- Queue the INSERT/UPDATE (price fields now have values) ---
+			// --- Queue the INSERT/UPDATE ---
 			batch.Queue(`
 				INSERT INTO shopify_sync_orders (
 					order_id, name, order_number, customer_id, email, phone, financial_status, fulfillment_status,
 					processed_at, currency, total_price, subtotal_price, total_tax, total_discounts, total_shipping,
 					billing_address, shipping_address, line_items, shipping_lines, discount_applications,
 					note, tags, created_at, updated_at, sync_date
-				) VALUES (
-					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-					$21, $22, $23, $24, $25
-				)
+				) VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25 )
 				ON CONFLICT (order_id) DO UPDATE SET
-					name = EXCLUDED.name, /* order_number = EXCLUDED.order_number, -- Don't update order_number if it doesn't exist in source */
-					customer_id = EXCLUDED.customer_id, email = EXCLUDED.email, phone = EXCLUDED.phone,
+					name = EXCLUDED.name, customer_id = EXCLUDED.customer_id, email = EXCLUDED.email, phone = EXCLUDED.phone,
 					financial_status = EXCLUDED.financial_status, fulfillment_status = EXCLUDED.fulfillment_status,
 					processed_at = EXCLUDED.processed_at, currency = EXCLUDED.currency, total_price = EXCLUDED.total_price,
 					subtotal_price = EXCLUDED.subtotal_price, total_tax = EXCLUDED.total_tax, total_discounts = EXCLUDED.total_discounts,
 					total_shipping = EXCLUDED.total_shipping, billing_address = EXCLUDED.billing_address,
 					shipping_address = EXCLUDED.shipping_address, line_items = EXCLUDED.line_items,
 					shipping_lines = EXCLUDED.shipping_lines, discount_applications = EXCLUDED.discount_applications,
-					note = EXCLUDED.note, tags = EXCLUDED.tags, created_at = EXCLUDED.created_at, /* Keep created_at from first insert */
+					note = EXCLUDED.note, tags = EXCLUDED.tags, /* created_at = EXCLUDED.created_at, -- Keep original */
 					updated_at = EXCLUDED.updated_at, sync_date = EXCLUDED.sync_date
-				WHERE shopify_sync_orders.updated_at IS DISTINCT FROM EXCLUDED.updated_at
-				   OR shopify_sync_orders.sync_date != EXCLUDED.sync_date
+				WHERE shopify_sync_orders.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR shopify_sync_orders.sync_date != EXCLUDED.sync_date
 			`, orderID, name, orderNumber, customerID, email, phone, financialStatus, fulfillmentStatus, processedAt, currencyCode,
 				totalPrice, subtotalPrice, totalTax, totalDiscounts, totalShipping, billingAddressJSON, shippingAddressJSON,
 				lineItemsJSON, shippingLinesJSON, discountApplicationsJSON, note, tagsString, createdAt, updatedAt, syncDate)
 			pageOrderCount++
 		}
 
-		// --- Batch Execution Logic ---
+		// Execute the batch for this page
 		if batch.Len() > 0 {
 			br := tx.SendBatch(ctx, batch)
 			var batchErr error
 			for i := 0; i < batch.Len(); i++ {
 				_, err := br.Exec()
 				if err != nil {
-					log.Printf("❌ Error processing order batch item %d page %d (v8 - pricesets): %v", i+1, pageCount, err)
+					log.Printf("❌ Error processing order batch item %d (page %d): %v", i+1, pageCount, err)
 					if batchErr == nil {
 						batchErr = fmt.Errorf("error in order batch item %d: %w", i+1, err)
 					}
@@ -1632,68 +1762,62 @@ func syncOrdersIncremental(ctx context.Context, conn *pgx.Conn, syncDate string,
 			}
 			closeErr := br.Close()
 			if batchErr != nil {
-				return orderCount, fmt.Errorf("order batch execution failed on page %d (v8 - pricesets): %w", pageCount, batchErr)
+				return totalProcessedThisInvocation, fmt.Errorf("order batch execution failed page %d: %w", pageCount, batchErr)
 			}
 			if closeErr != nil {
-				return orderCount, fmt.Errorf("order batch close failed on page %d (v8 - pricesets): %w", pageCount, closeErr)
+				return totalProcessedThisInvocation, fmt.Errorf("order batch close failed page %d: %w", pageCount, closeErr)
 			}
-			orderCount += pageOrderCount
-			log.Printf("Successfully processed batch for %d orders on page %d.", pageOrderCount, pageCount)
+			totalProcessedThisInvocation += pageOrderCount
+			log.Printf("Successfully processed batch for %d orders (page %d).", pageOrderCount, pageCount)
 		} else {
 			log.Printf("No orders queued for batch on page %d.", pageCount)
 		}
 
-		// --- Pagination Logic ---
-		if !hasNextPage {
-			log.Printf("Info: No more order pages after page %d (v8 - pricesets sync).", pageCount)
-			break
+		// Update cursor for the *next* iteration of the loop
+		currentCursor = nil
+		if finalCursor.Valid {
+			cursorStr := finalCursor.String
+			currentCursor = &cursorStr
 		}
-		endCursorVal, ok := pageInfo["endCursor"].(string)
-		if !ok || endCursorVal == "" {
-			log.Printf("Warning: Invalid endCursor for orders on page %d. Stopping.", pageCount)
-			break
-		}
-		cursor = &endCursorVal
-	} // End order pagination loop
 
-	// --- Commit Transaction ---
-	if err := tx.Commit(ctx); err != nil {
-		return orderCount, fmt.Errorf("failed to commit order tx (v8 - pricesets): %w", err)
+		if !hasNextPage {
+			log.Println("No next page indicated by pageInfo. Ending order sync loop.")
+			break
+		}
 	}
 
-	log.Printf("✅ Successfully synced %d Shopify orders across %d pages (pageSize=%d, v8 - pricesets sync).\n", orderCount, pageCount, pageSize)
-	return orderCount, nil
+	// --- Update Sync State *after* the loop ---
+	log.Printf("Order sync loop finished. Processed %d orders total this invocation. Final hasNextPage: %t", totalProcessedThisInvocation, hasNextPage)
+
+	err = UpdateSyncState(ctx, tx, "orders", finalCursor, sql.NullInt64{}, sql.NullInt64{},
+		totalProcessedThisInvocation, hasNextPage, nil)
+	if err != nil {
+		return totalProcessedThisInvocation, fmt.Errorf("failed to update final sync state for orders: %w", err)
+	}
+
+	// --- Commit the transaction ---
+	if err := tx.Commit(ctx); err != nil {
+		return totalProcessedThisInvocation, fmt.Errorf("failed to commit final order transaction: %w", err)
+	}
+
+	log.Printf("✅ Successfully processed %d Shopify orders incrementally with time guarding.", totalProcessedThisInvocation)
+	return totalProcessedThisInvocation, nil
 }
 
-// syncCollectionsIncremental processes a small chunk of collections using the provided sync state
+// syncCollectionsIncremental processes multiple chunks of collections respecting context deadline.
 func syncCollectionsIncremental(ctx context.Context, conn *pgx.Conn, syncDate string, state *SyncState) (int, error) {
-	log.Println("Processing incremental Shopify collection sync...")
+	log.Println("Processing incremental Shopify collection sync with time guarding...")
 
-	// Use a smaller page size for faster processing
-	pageSize := 25
-
-	// Limit to only 1 page per invocation
-	maxPagesToProcess := 1
+	pageSize := 25 // Keep batch size manageable
 
 	query := fmt.Sprintf(`
 		query GetCollections($cursor: String) {
 			collections(first: %d, after: $cursor, sortKey: UPDATED_AT) {
 				pageInfo { hasNextPage endCursor }
 				nodes {
-					id
-					title
-					handle
-					descriptionHtml
-					productsCount {
-						count
-					}
-					ruleSet {
-						rules { column relation condition }
-						appliedDisjunctively
-					}
-					sortOrder
-					templateSuffix
-					updatedAt
+					id title handle descriptionHtml productsCount { count }
+					ruleSet { rules { column relation condition } appliedDisjunctively }
+					sortOrder templateSuffix updatedAt
 				}
 			}
 		}
@@ -1705,73 +1829,96 @@ func syncCollectionsIncremental(ctx context.Context, conn *pgx.Conn, syncDate st
 	}
 	defer tx.Rollback(ctx)
 
-	collectionCount := 0
+	totalProcessedThisInvocation := 0
 	pageCount := 0
+	hasNextPage := true            // Assume true initially or based on state
+	var currentCursor *string      // For fetching the current page
+	var finalCursor sql.NullString // For the *next* invocation
 
-	// Get cursor from sync state if available
-	var cursor *string
+	// Initialize cursor from state
 	if state.LastCursor.Valid && state.LastCursor.String != "" {
 		cursorStr := state.LastCursor.String
-		cursor = &cursorStr
+		currentCursor = &cursorStr
+		finalCursor = state.LastCursor // Start with the current state's cursor
 	}
 
-	for pageCount < maxPagesToProcess {
+	// Loop until no more pages OR timeout approaches OR error occurs
+	for hasNextPage {
+		pageCount++
+		log.Printf("Collection sync: Processing page %d", pageCount)
+
+		// --- TIME GUARD ---
+		deadline, ok := ctx.Deadline()
+		if ok {
+			remainingTime := time.Until(deadline)
+			log.Printf("Collection sync: Time remaining: %v", remainingTime)
+			if remainingTime < timeBufferBeforeTimeout {
+				log.Printf("Collection sync: Approaching timeout (%v remaining < %v buffer). Exiting loop.", remainingTime, timeBufferBeforeTimeout)
+				hasNextPage = true // Ensure we mark as in_progress
+				break              // Exit gracefully
+			}
+		} else {
+			log.Printf("Collection sync: Context has no deadline.")
+		}
+		// --- END TIME GUARD ---
+
 		variables := map[string]interface{}{}
-		if cursor != nil {
-			variables["cursor"] = *cursor
+		if currentCursor != nil {
+			variables["cursor"] = *currentCursor
 		}
 
-		log.Printf("Fetching collection page (cursor: %v)\n", cursor)
+		log.Printf("Fetching collection page (cursor: %v)\n", currentCursor)
 		data, err := executeGraphQLQuery(query, variables)
 		if err != nil {
-			return collectionCount, fmt.Errorf("collection graphql query failed: %w", err)
+			return totalProcessedThisInvocation, fmt.Errorf("collection graphql query failed on page %d: %w", pageCount, err)
 		}
 
 		if data == nil {
-			log.Printf("Warning: Nil data map for collections page.")
+			log.Printf("Warning: Nil data map received for collections page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false}
 			break
 		}
 
 		collectionsData, ok := data["collections"].(map[string]interface{})
 		if !ok || collectionsData == nil {
-			log.Printf("Warning: Invalid 'collections' structure.")
+			log.Printf("Warning: Invalid 'collections' structure on page %d.", pageCount)
+			hasNextPage = false
+			finalCursor = sql.NullString{Valid: false}
 			break
 		}
 
-		// Updated to use nodes instead of edges
-		nodes, _ := collectionsData["nodes"].([]interface{})
-
+		nodes, _ := collectionsData["nodes"].([]interface{}) // Using nodes
 		pageInfo, piOK := collectionsData["pageInfo"].(map[string]interface{})
-		hasNextPage := piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		hasNextPage = piOK && pageInfo != nil && safeGetBool(pageInfo, "hasNextPage")
+
+		if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
+			finalCursor = sql.NullString{String: endCursorVal, Valid: true}
+		} else {
+			if hasNextPage {
+				log.Printf("Warning: hasNextPage is true but endCursor is missing on collection page %d.", pageCount)
+			}
+			finalCursor = sql.NullString{Valid: false}
+		}
 
 		if len(nodes) == 0 {
-			log.Printf("Info: No collections found on page.")
+			log.Printf("Info: No collections found on page %d.", pageCount)
 			if !hasNextPage {
-				break // Exit loop if no nodes and no next page
-			}
-
-			// If hasNextPage is true but no nodes, update cursor and continue
-			if endCursorVal, ok := pageInfo["endCursor"].(string); ok && endCursorVal != "" {
-				// Update sync state with new cursor
-				nextCursor := sql.NullString{String: endCursorVal, Valid: true}
-				err = UpdateSyncState(ctx, tx, "collections", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-					0, hasNextPage, nil)
-				if err != nil {
-					return collectionCount, fmt.Errorf("failed to update sync state: %w", err)
-				}
-
-				// Commit transaction and exit
-				if err := tx.Commit(ctx); err != nil {
-					return collectionCount, fmt.Errorf("failed to commit collection transaction: %w", err)
-				}
-				return 0, nil
-			} else {
-				log.Printf("Warning: hasNextPage is true but endCursor is missing on collection page. Stopping.")
+				log.Println("No collections and no next page indicated. Ending collection sync.")
 				break
+			} else {
+				log.Println("No collections but next page indicated. Continuing to update state with cursor.")
+				currentCursor = nil
+				if finalCursor.Valid {
+					cursorStr := finalCursor.String
+					currentCursor = &cursorStr
+				}
+				continue
 			}
 		}
 
-		log.Printf("Processing %d collections...\n", len(nodes))
+		log.Printf("Processing %d collections from page %d...\n", len(nodes), pageCount)
 		batch := &pgx.Batch{}
 		pageCollectionCount := 0
 
@@ -1794,36 +1941,20 @@ func syncCollectionsIncremental(ctx context.Context, conn *pgx.Conn, syncDate st
 			descriptionHtml := safeGetString(nodeMap, "descriptionHtml")
 			sortOrder := safeGetString(nodeMap, "sortOrder")
 			templateSuffix := safeGetString(nodeMap, "templateSuffix")
-
-			// Extract productsCount from the nested structure
 			productsCount := 0
 			if pcMap, ok := nodeMap["productsCount"].(map[string]interface{}); ok && pcMap != nil {
 				productsCount = safeGetInt(pcMap, "count")
 			}
-
 			updatedAt := safeGetTimestamp(nodeMap, "updatedAt")
 			productsJSON := []byte("null") // Not fetching product list
 			ruleSetJSON := safeGetJSONB(nodeMap, "ruleSet")
-
-			// Since we don't have access to publishedOnCurrentPublication field
-			// Use updatedAt as the publishedAt timestamp
-			publishedAt := updatedAt
+			publishedAt := updatedAt // Using updatedAt as publishedAt
 
 			batch.Queue(`
 				INSERT INTO shopify_sync_collections ( collection_id, title, handle, description, description_html, products_count, products, rule_set, sort_order, published_at, template_suffix, updated_at, sync_date )
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT (collection_id) DO UPDATE SET
-					title = EXCLUDED.title, 
-					handle = EXCLUDED.handle, 
-					description_html = EXCLUDED.description_html, 
-					products_count = EXCLUDED.products_count, 
-					products = EXCLUDED.products, 
-					rule_set = EXCLUDED.rule_set, 
-					sort_order = EXCLUDED.sort_order, 
-					published_at = EXCLUDED.published_at, 
-					template_suffix = EXCLUDED.template_suffix, 
-					updated_at = EXCLUDED.updated_at, 
-					sync_date = EXCLUDED.sync_date
+					title = EXCLUDED.title, handle = EXCLUDED.handle, description_html = EXCLUDED.description_html, products_count = EXCLUDED.products_count, products = EXCLUDED.products, rule_set = EXCLUDED.rule_set, sort_order = EXCLUDED.sort_order, published_at = EXCLUDED.published_at, template_suffix = EXCLUDED.template_suffix, updated_at = EXCLUDED.updated_at, sync_date = EXCLUDED.sync_date
 				WHERE shopify_sync_collections.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR shopify_sync_collections.sync_date != EXCLUDED.sync_date
 			`, collectionID, title, handle, "" /* description */, descriptionHtml, productsCount, productsJSON, ruleSetJSON, sortOrder, publishedAt, templateSuffix, updatedAt, syncDate)
 			pageCollectionCount++
@@ -1835,7 +1966,7 @@ func syncCollectionsIncremental(ctx context.Context, conn *pgx.Conn, syncDate st
 			for i := 0; i < batch.Len(); i++ {
 				_, err := br.Exec()
 				if err != nil {
-					log.Printf("❌ Error processing collection batch item %d: %v", i+1, err)
+					log.Printf("❌ Error processing collection batch item %d (page %d): %v", i+1, pageCount, err)
 					if batchErr == nil {
 						batchErr = fmt.Errorf("error in collection batch item %d: %w", i+1, err)
 					}
@@ -1843,385 +1974,325 @@ func syncCollectionsIncremental(ctx context.Context, conn *pgx.Conn, syncDate st
 			}
 			closeErr := br.Close()
 			if batchErr != nil {
-				return collectionCount, fmt.Errorf("collection batch execution failed: %w", batchErr)
+				return totalProcessedThisInvocation, fmt.Errorf("collection batch execution failed page %d: %w", pageCount, batchErr)
 			}
 			if closeErr != nil {
-				return collectionCount, fmt.Errorf("collection batch close failed: %w", closeErr)
+				return totalProcessedThisInvocation, fmt.Errorf("collection batch close failed page %d: %w", pageCount, closeErr)
 			}
-			collectionCount += pageCollectionCount
-			log.Printf("Successfully processed batch for %d collections.", pageCollectionCount)
+			totalProcessedThisInvocation += pageCollectionCount
+			log.Printf("Successfully processed batch for %d collections (page %d).", pageCollectionCount, pageCount)
 		} else {
-			log.Printf("No collections queued for batch.")
+			log.Printf("No collections queued for batch on page %d.", pageCount)
 		}
 
-		// Update the sync state within transaction
-		var nextCursor sql.NullString
-		if hasNextPage {
-			endCursorVal, ok := pageInfo["endCursor"].(string)
-			if ok && endCursorVal != "" {
-				nextCursor = sql.NullString{String: endCursorVal, Valid: true}
-			}
-		}
-
-		err = UpdateSyncState(ctx, tx, "collections", nextCursor, sql.NullInt64{}, sql.NullInt64{},
-			pageCollectionCount, hasNextPage, nil)
-		if err != nil {
-			return collectionCount, fmt.Errorf("failed to update sync state: %w", err)
+		currentCursor = nil
+		if finalCursor.Valid {
+			cursorStr := finalCursor.String
+			currentCursor = &cursorStr
 		}
 
 		if !hasNextPage {
-			break // Exit loop if no next page
+			log.Println("No next page indicated by pageInfo. Ending collection sync loop.")
+			break
 		}
-
-		// Update cursor for next iteration
-		if nextCursor.Valid {
-			cursorStr := nextCursor.String
-			cursor = &cursorStr
-		}
-
-		pageCount++
 	}
 
+	// --- Update Sync State *after* the loop ---
+	log.Printf("Collection sync loop finished. Processed %d collections total this invocation. Final hasNextPage: %t", totalProcessedThisInvocation, hasNextPage)
+
+	err = UpdateSyncState(ctx, tx, "collections", finalCursor, sql.NullInt64{}, sql.NullInt64{},
+		totalProcessedThisInvocation, hasNextPage, nil)
+	if err != nil {
+		return totalProcessedThisInvocation, fmt.Errorf("failed to update final sync state for collections: %w", err)
+	}
+
+	// --- Commit the transaction ---
 	if err := tx.Commit(ctx); err != nil {
-		return collectionCount, fmt.Errorf("failed to commit collection transaction: %w", err)
+		return totalProcessedThisInvocation, fmt.Errorf("failed to commit final collection transaction: %w", err)
 	}
 
-	log.Printf("✅ Successfully processed %d Shopify collections incrementally.", collectionCount)
-	return collectionCount, nil
+	log.Printf("✅ Successfully processed %d Shopify collections incrementally with time guarding.", totalProcessedThisInvocation)
+	return totalProcessedThisInvocation, nil
 }
 
-// syncBlogArticlesIncremental processes a small chunk of blog articles using the provided sync state
+// syncBlogArticlesIncremental processes multiple chunks of blog articles respecting context deadline.
 func syncBlogArticlesIncremental(ctx context.Context, conn *pgx.Conn, syncDate string, state *SyncState) (int, error) {
-	log.Println("Processing incremental Shopify blog/article sync...")
+	log.Println("Processing incremental Shopify blog/article sync with time guarding...")
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin article transaction: %w", err)
 	}
-	defer tx.Rollback(ctx) // Ensure rollback on error
+	defer tx.Rollback(ctx)
 
-	// For blog article sync, we need to track both the current blog ID and the last article ID
-	var currentBlogID int64
-	var sinceID int64
+	totalProcessedThisInvocation := 0
+	pageCount := 0 // Tracks article pages *within* a blog or across blogs in this invocation
 
-	if state.CurrentBlogID.Valid {
-		currentBlogID = state.CurrentBlogID.Int64
-	}
+	// State variables for the entire invocation
+	currentBlogID := state.CurrentBlogID
+	currentSinceID := state.LastRestSinceID
+	hasNextPage := true // Overall flag, true if more blogs or more articles in current blog
 
-	if state.LastRestSinceID.Valid {
-		sinceID = state.LastRestSinceID.Int64
-	}
+	// Final state to be saved
+	finalBlogID := currentBlogID
+	finalSinceID := currentSinceID
 
-	// If we don't have a current blog ID, we need to fetch the list of blogs first
-	if currentBlogID == 0 {
+	// If we don't have a current blog ID, fetch blogs first
+	if !currentBlogID.Valid {
+		log.Println("No current blog ID set, fetching blog list...")
 		blogs, err := fetchShopifyBlogs()
 		if err != nil {
-			return 0, fmt.Errorf("failed to fetch blogs: %w", err)
+			return 0, fmt.Errorf("failed to fetch blogs to start sync: %w", err)
 		}
-
 		if len(blogs) == 0 {
-			// No blogs to process
-			_ = UpdateSyncState(ctx, tx, "blogs", sql.NullString{}, sql.NullInt64{}, sql.NullInt64{},
-				0, false, nil)
-			// No need to check err here
-
-			if err := tx.Commit(ctx); err != nil {
-				return 0, fmt.Errorf("failed to commit transaction: %w", err)
+			log.Println("No blogs found in store. Marking blog sync as complete.")
+			hasNextPage = false // No work to do
+			// Update state immediately and commit
+			err = UpdateSyncState(ctx, tx, "blogs", sql.NullString{}, sql.NullInt64{}, sql.NullInt64{}, 0, false, nil)
+			if err != nil {
+				return 0, fmt.Errorf("failed to update sync state for no blogs: %w", err)
 			}
-
-			log.Println("No blogs found to process.")
+			if err := tx.Commit(ctx); err != nil {
+				return 0, fmt.Errorf("failed to commit no blogs state: %w", err)
+			}
 			return 0, nil
 		}
-
 		// Start with the first blog
-		currentBlogID = blogs[0].ID
-		sinceID = 0
-
-		log.Printf("Starting with blog ID %d: %s", currentBlogID, blogs[0].Title)
+		currentBlogID = sql.NullInt64{Int64: blogs[0].ID, Valid: true}
+		currentSinceID = sql.NullInt64{Valid: false} // Reset sinceID for new blog
+		finalBlogID = currentBlogID
+		finalSinceID = currentSinceID
+		log.Printf("Starting article sync with first blog ID %d: %s", currentBlogID.Int64, blogs[0].Title)
 	} else {
-		log.Printf("Continuing with blog ID %d, since_id %d", currentBlogID, sinceID)
+		log.Printf("Continuing article sync with blog ID %d, since_id %d", currentBlogID.Int64, currentSinceID.Int64)
 	}
 
-	// Process articles for this blog with pagination - just one page per invocation
-	articles, hasMore, nextSinceID, err := fetchShopifyArticles(currentBlogID, sinceID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch articles for blog %d: %w", currentBlogID, err)
-	}
+	// Loop processing article pages or switching blogs, respecting time limits
+	for hasNextPage {
+		pageCount++
+		log.Printf("Article sync: Processing batch/page %d (BlogID: %v, SinceID: %v)", pageCount, currentBlogID.Int64, currentSinceID.Int64)
 
-	articleCount := len(articles)
-	log.Printf("Processing %d articles from blog %d...", articleCount, currentBlogID)
-
-	// If no articles found, we might need to move to the next blog
-	if articleCount == 0 {
-		// Try to get the next blog
-		blogs, err := fetchShopifyBlogs()
-		if err != nil {
-			return 0, fmt.Errorf("failed to fetch blogs for next blog: %w", err)
-		}
-
-		// Find current blog index
-		nextBlogFound := false
-		for i, blog := range blogs {
-			if blog.ID == currentBlogID && i < len(blogs)-1 {
-				// Move to the next blog
-				nextBlog := blogs[i+1]
-				nextBlogID := nextBlog.ID
-
-				log.Printf("Moving to next blog ID %d: %s", nextBlogID, nextBlog.Title)
-
-				// Update sync state to move to the next blog with reset sinceID
-				_ = UpdateSyncState(ctx, tx, "blogs",
-					sql.NullString{},
-					sql.NullInt64{Valid: false}, // Reset sinceID
-					sql.NullInt64{Int64: nextBlogID, Valid: true},
-					0, true, nil)
-
-				// No need to check err here
-
-				nextBlogFound = true
-				break
+		// --- TIME GUARD ---
+		deadline, ok := ctx.Deadline()
+		if ok {
+			remainingTime := time.Until(deadline)
+			log.Printf("Article sync: Time remaining: %v", remainingTime)
+			if remainingTime < timeBufferBeforeTimeout {
+				log.Printf("Article sync: Approaching timeout (%v remaining < %v buffer). Exiting loop.", remainingTime, timeBufferBeforeTimeout)
+				hasNextPage = true          // Force in_progress state as we stopped early
+				finalBlogID = currentBlogID // Save the current state
+				finalSinceID = currentSinceID
+				break // Exit gracefully
 			}
+		} else {
+			log.Printf("Article sync: Context has no deadline.")
+		}
+		// --- END TIME GUARD ---
+
+		// Fetch articles for the current blog
+		articles, hasMoreArticlesInBlog, nextSinceIDForBlog, err := fetchShopifyArticles(currentBlogID.Int64, currentSinceID.Int64)
+		if err != nil {
+			return totalProcessedThisInvocation, fmt.Errorf("failed to fetch articles for blog %d (page %d): %w", currentBlogID.Int64, pageCount, err)
 		}
 
-		// If we've reached the last blog, mark as completed
-		if !nextBlogFound {
-			log.Println("Processed all blogs. Sync complete.")
+		articleCount := len(articles)
+		log.Printf("Fetched %d articles for blog %d. More in this blog: %t", articleCount, currentBlogID.Int64, hasMoreArticlesInBlog)
 
-			// Mark as completed by setting hasNextPage to false
-			_ = UpdateSyncState(ctx, tx, "blogs",
-				sql.NullString{},
-				sql.NullInt64{Valid: false},
-				sql.NullInt64{Valid: false},
-				0, false, nil)
+		// Update the 'sinceID' for the *next* potential fetch *of this blog*
+		currentSinceID = sql.NullInt64{Int64: nextSinceIDForBlog, Valid: true}
 
-			// No need to check err here
-		}
+		if articleCount > 0 {
+			// Process fetched articles
+			batch := &pgx.Batch{}
+			pageArticleCount := 0
 
-		// Commit transaction and return
-		if err := tx.Commit(ctx); err != nil {
-			return 0, fmt.Errorf("failed to commit transaction: %w", err)
-		}
-
-		return 0, nil
-	}
-
-	// Process articles in batch
-	batch := &pgx.Batch{}
-
-	// First, get blog title for the current blog
-	var blogTitle string
-	blogs, _ := fetchShopifyBlogs()
-	for _, blog := range blogs {
-		if blog.ID == currentBlogID {
-			blogTitle = blog.Title
-			break
-		}
-	}
-
-	for _, article := range articles {
-		articleID := article.ID
-		title := article.Title
-		content := article.BodyValue
-		contentHtml := article.Body
-		excerpt := article.Summary
-		handle := article.Handle
-		authorName := article.Author
-
-		// Map published status to status field
-		status := "hidden"
-		if article.Published {
-			status = "published"
-		}
-
-		commentsCount := article.CommentsCount
-		publishedAt := article.PublishedAt
-		createdAt := article.CreatedAt
-		updatedAt := article.UpdatedAt
-
-		// Convert arrays to comma-separated strings
-		var tagsString string
-		switch tags := article.Tags.(type) {
-		case []interface{}:
-			// Handle array of strings
-			tagsList := make([]string, 0, len(tags))
-			for _, t := range tags {
-				if tagStr, ok := t.(string); ok {
-					tagsList = append(tagsList, tagStr)
+			var blogTitle string // Get current blog title
+			blogs, _ := fetchShopifyBlogs()
+			for _, blog := range blogs {
+				if blog.ID == currentBlogID.Int64 {
+					blogTitle = blog.Title
+					break
 				}
 			}
-			tagsString = strings.Join(tagsList, ",")
-		case []string:
-			// Handle []string directly
-			tagsString = strings.Join(tags, ",")
-		case string:
-			// Handle already comma-separated string
-			tagsString = tags
-		default:
-			// Handle empty or other cases
-			tagsString = ""
-		}
 
-		// Convert image and SEO data to JSON
-		var imageJSON []byte
-		if article.Image != nil {
-			imageJSON, _ = json.Marshal(article.Image)
+			for _, article := range articles {
+				// Extract article fields
+				articleID := article.ID
+				title := article.Title
+				content := article.BodyValue
+				contentHtml := article.Body
+				excerpt := article.Summary
+				handle := article.Handle
+				authorName := article.Author
+				status := "hidden"
+				if article.Published {
+					status = "published"
+				}
+				commentsCount := article.CommentsCount
+				publishedAt := article.PublishedAt
+				createdAt := article.CreatedAt
+				updatedAt := article.UpdatedAt
+
+				// Handle tags based on type
+				tagsString := ""
+				switch tags := article.Tags.(type) {
+				case []interface{}:
+					tagsList := make([]string, 0, len(tags))
+					for _, t := range tags {
+						if tagStr, ok := t.(string); ok {
+							tagsList = append(tagsList, tagStr)
+						}
+					}
+					tagsString = strings.Join(tagsList, ",")
+				case []string:
+					tagsString = strings.Join(tags, ",")
+				case string:
+					tagsString = tags
+				}
+
+				// Handle image and SEO JSON
+				var imageJSON []byte
+				if article.Image != nil {
+					imageJSON, _ = json.Marshal(article.Image)
+				} else {
+					imageJSON = []byte("null")
+				}
+
+				var seoJSON []byte
+				if article.SEO != nil {
+					seoJSON, _ = json.Marshal(article.SEO)
+				} else {
+					seoJSON = []byte("null")
+				}
+
+				// Queue article for batch insert/update
+				batch.Queue(`
+					INSERT INTO shopify_sync_blog_articles (
+						blog_id, article_id, blog_title, title, author, content, content_html, excerpt, handle,
+						image, tags, seo, status, published_at, created_at, updated_at, comments_count,
+						summary_html, template_suffix, sync_date
+					) VALUES (
+						$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+					)
+					ON CONFLICT (blog_id, article_id) DO UPDATE SET
+						blog_title = EXCLUDED.blog_title,
+						title = EXCLUDED.title,
+						author = EXCLUDED.author,
+						content = EXCLUDED.content,
+						content_html = EXCLUDED.content_html,
+						excerpt = EXCLUDED.excerpt,
+						handle = EXCLUDED.handle,
+						image = EXCLUDED.image,
+						tags = EXCLUDED.tags,
+						seo = EXCLUDED.seo,
+						status = EXCLUDED.status,
+						published_at = EXCLUDED.published_at,
+						created_at = EXCLUDED.created_at,
+						updated_at = EXCLUDED.updated_at,
+						comments_count = EXCLUDED.comments_count,
+						summary_html = EXCLUDED.summary_html,
+						template_suffix = EXCLUDED.template_suffix,
+						sync_date = EXCLUDED.sync_date
+					WHERE shopify_sync_blog_articles.updated_at IS DISTINCT FROM EXCLUDED.updated_at
+						OR shopify_sync_blog_articles.sync_date != EXCLUDED.sync_date
+				`,
+					currentBlogID.Int64, articleID, blogTitle, title, authorName, content, contentHtml,
+					excerpt, handle, imageJSON, tagsString, seoJSON, status, publishedAt, createdAt,
+					updatedAt, commentsCount, article.Summary, article.TemplateSuffix, syncDate)
+
+				pageArticleCount++
+			}
+
+			// Execute DB Batch
+			if batch.Len() > 0 {
+				br := tx.SendBatch(ctx, batch)
+				var batchErr error
+				for i := 0; i < batch.Len(); i++ {
+					_, err := br.Exec()
+					if err != nil {
+						log.Printf("❌ Error article batch item %d (blog %d): %v", i+1, currentBlogID.Int64, err)
+						if batchErr == nil {
+							batchErr = err
+						}
+					}
+				}
+				closeErr := br.Close()
+				if batchErr != nil {
+					return totalProcessedThisInvocation, fmt.Errorf("article batch exec failed (blog %d): %w", currentBlogID.Int64, batchErr)
+				}
+				if closeErr != nil {
+					return totalProcessedThisInvocation, fmt.Errorf("article batch close failed (blog %d): %w", currentBlogID.Int64, closeErr)
+				}
+				totalProcessedThisInvocation += pageArticleCount
+				log.Printf("Successfully processed DB batch for %d articles (blog %d).", pageArticleCount, currentBlogID.Int64)
+			}
+		} // End if articleCount > 0
+
+		// Decide next step: continue this blog, switch blog, or finish?
+		if hasMoreArticlesInBlog {
+			// Continue fetching from the current blog in the next loop iteration (or next invocation)
+			hasNextPage = true
+			finalBlogID = currentBlogID   // Keep current blog
+			finalSinceID = currentSinceID // Use the updated sinceID from fetch
+			log.Printf("More articles exist for blog %d. Next since_id: %d", finalBlogID.Int64, finalSinceID.Int64)
 		} else {
-			imageJSON = []byte("null")
-		}
-
-		var seoJSON []byte
-		if article.SEO != nil {
-			seoJSON, _ = json.Marshal(article.SEO)
-		} else {
-			seoJSON = []byte("null")
-		}
-
-		// Queue the INSERT/UPDATE
-		batch.Queue(`
-		 INSERT INTO shopify_sync_blog_articles (
-		   blog_id, article_id, blog_title, title, author, content, content_html, excerpt, handle,
-		   image, tags, seo, status, published_at, created_at, updated_at, comments_count,
-		   summary_html, template_suffix, sync_date
-		 ) VALUES (
-		   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
-		 )
-		 ON CONFLICT (blog_id, article_id) DO UPDATE SET
-		   blog_title = EXCLUDED.blog_title,
-		   title = EXCLUDED.title,
-		   author = EXCLUDED.author,
-		   content = EXCLUDED.content,
-		   content_html = EXCLUDED.content_html,
-		   excerpt = EXCLUDED.excerpt,
-		   handle = EXCLUDED.handle,
-		   image = EXCLUDED.image,
-		   tags = EXCLUDED.tags,
-		   seo = EXCLUDED.seo,
-		   status = EXCLUDED.status,
-		   published_at = EXCLUDED.published_at,
-		   created_at = EXCLUDED.created_at,
-		   updated_at = EXCLUDED.updated_at,
-		   comments_count = EXCLUDED.comments_count,
-		   summary_html = EXCLUDED.summary_html,
-		   template_suffix = EXCLUDED.template_suffix,
-		   sync_date = EXCLUDED.sync_date
-		   WHERE shopify_sync_blog_articles.updated_at IS DISTINCT FROM EXCLUDED.updated_at
-		   OR shopify_sync_blog_articles.sync_date != EXCLUDED.sync_date
-	   `,
-			currentBlogID,
-			articleID,
-			blogTitle,
-			title,
-			authorName,
-			content,
-			contentHtml,
-			excerpt,
-			handle,
-			imageJSON,
-			tagsString,
-			seoJSON,
-			status,
-			publishedAt,
-			createdAt,
-			updatedAt,
-			commentsCount,
-			article.Summary,
-			article.TemplateSuffix,
-			syncDate,
-		)
-	}
-
-	// Execute the batch
-	if batch.Len() > 0 {
-		br := tx.SendBatch(ctx, batch)
-		var batchErr error
-		for i := 0; i < batch.Len(); i++ {
-			_, err := br.Exec()
+			// Finished current blog, try to find the next one
+			log.Printf("Finished processing articles for blog %d. Checking for next blog...", currentBlogID.Int64)
+			blogs, err := fetchShopifyBlogs() // Refetch might be needed if blogs change
 			if err != nil {
-				log.Printf("❌ Error processing article batch item %d: %v", i+1, err)
-				if batchErr == nil {
-					batchErr = fmt.Errorf("error in article batch item %d: %w", i+1, err)
+				return totalProcessedThisInvocation, fmt.Errorf("failed to fetch blogs list to find next blog: %w", err)
+			}
+
+			nextBlogFound := false
+			for i, blog := range blogs {
+				if blog.ID == currentBlogID.Int64 {
+					if i < len(blogs)-1 { // Check if there's a next blog
+						nextBlog := blogs[i+1]
+						currentBlogID = sql.NullInt64{Int64: nextBlog.ID, Valid: true}
+						currentSinceID = sql.NullInt64{Valid: false} // Reset sinceID for new blog
+						finalBlogID = currentBlogID
+						finalSinceID = currentSinceID
+						hasNextPage = true // Found another blog to process
+						nextBlogFound = true
+						log.Printf("Moving to next blog ID %d: %s", currentBlogID.Int64, nextBlog.Title)
+						break
+					}
 				}
 			}
-		}
-		closeErr := br.Close()
-		if batchErr != nil {
-			return 0, fmt.Errorf("article batch execution failed: %w", batchErr)
-		}
-		if closeErr != nil {
-			return 0, fmt.Errorf("article batch close failed: %w", closeErr)
-		}
-		log.Printf("Successfully processed batch for %d articles from blog %d.", articleCount, currentBlogID)
-	} else {
-		log.Printf("No articles queued for batch from blog %d.", currentBlogID)
-	}
 
-	// Update sync state
-	var nextCursor sql.NullString
-	var nextBlogID sql.NullInt64
-
-	// If we have more articles for this blog, update the sinceID
-	if hasMore {
-		log.Printf("More articles available for blog %d. Next since_id: %d", currentBlogID, nextSinceID)
-		nextBlogID = sql.NullInt64{Int64: currentBlogID, Valid: true}
-		err = UpdateSyncState(ctx, tx, "blogs",
-			nextCursor,
-			sql.NullInt64{Int64: nextSinceID, Valid: true},
-			nextBlogID,
-			articleCount, true, nil)
-	} else {
-		// Try to find the next blog
-		blogs, err := fetchShopifyBlogs()
-		if err != nil {
-			return articleCount, fmt.Errorf("failed to fetch blogs for next blog: %w", err)
-		}
-
-		// Find current blog index
-		nextBlogFound := false
-		for i, blog := range blogs {
-			if blog.ID == currentBlogID && i < len(blogs)-1 {
-				// Move to the next blog
-				nextBlogID = sql.NullInt64{Int64: blogs[i+1].ID, Valid: true}
-				log.Printf("Moving to next blog ID %d: %s", nextBlogID.Int64, blogs[i+1].Title)
-
-				// Update sync state to move to the next blog with reset sinceID
-				err = UpdateSyncState(ctx, tx, "blogs",
-					nextCursor,
-					sql.NullInt64{Valid: false}, // Reset sinceID
-					nextBlogID,
-					articleCount, true, nil)
-				if err != nil {
-					return articleCount, fmt.Errorf("failed to update sync state for next blog: %w", err)
-				}
-
-				nextBlogFound = true
-				break
+			if !nextBlogFound {
+				log.Println("No more blogs found after the current one. Ending blog sync.")
+				hasNextPage = false                       // All blogs processed
+				finalBlogID = sql.NullInt64{Valid: false} // Reset final state
+				finalSinceID = sql.NullInt64{Valid: false}
+				break // Exit the main loop
 			}
 		}
 
-		// If we've reached the last blog, mark as completed
-		if !nextBlogFound {
-			log.Println("Processed all blogs. Sync complete.")
-
-			// Mark as completed by setting hasNextPage to false
-			_ = UpdateSyncState(ctx, tx, "blogs",
-				nextCursor,
-				sql.NullInt64{Valid: false},
-				sql.NullInt64{Valid: false},
-				articleCount, false, nil)
+		// If we are continuing (either more articles in this blog or switched to next blog),
+		// and hasNextPage is still true, the loop continues.
+		if !hasNextPage {
+			break // Exit if we determined there's no next page/blog
 		}
-	}
+	} // End main processing loop
 
+	// --- Update Sync State *after* the loop ---
+	log.Printf("Article sync loop finished. Processed %d articles total this invocation. Final hasNextPage: %t. Final BlogID: %v, Final SinceID: %v",
+		totalProcessedThisInvocation, hasNextPage, finalBlogID.Int64, finalSinceID.Int64)
+
+	err = UpdateSyncState(ctx, tx, "blogs", sql.NullString{}, finalSinceID, finalBlogID,
+		totalProcessedThisInvocation, hasNextPage, nil)
 	if err != nil {
-		return articleCount, fmt.Errorf("failed to update sync state: %w", err)
+		return totalProcessedThisInvocation, fmt.Errorf("failed to update final sync state for blogs: %w", err)
 	}
 
-	// Commit the transaction
+	// --- Commit the transaction ---
 	if err := tx.Commit(ctx); err != nil {
-		return articleCount, fmt.Errorf("failed to commit article transaction: %w", err)
+		return totalProcessedThisInvocation, fmt.Errorf("failed to commit final article transaction: %w", err)
 	}
 
-	log.Printf("✅ Successfully processed %d Shopify blog articles incrementally.", articleCount)
-	return articleCount, nil
+	log.Printf("✅ Successfully processed %d Shopify blog articles incrementally with time guarding.", totalProcessedThisInvocation)
+	return totalProcessedThisInvocation, nil
 }
 
 // ShopifyBlog represents a blog returned from the Shopify REST API

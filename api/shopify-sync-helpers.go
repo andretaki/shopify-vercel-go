@@ -32,6 +32,9 @@ type SyncState struct {
 // Known entity types in processing order
 var entityProcessingOrder = []string{"products", "customers", "orders", "collections", "blogs"}
 
+// Add a constant for the stale threshold
+const staleThreshold = 10 * time.Minute // e.g., 10 minutes
+
 // initShopifySyncTables initializes all required tables, including the sync state table.
 // This replaces the function in shopify-export.go
 func initShopifySyncTables(ctx context.Context, conn *pgx.Conn) error {
@@ -197,7 +200,8 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 	now := time.Now()
 	var status string
 	var lastError sql.NullString
-	endTime := sql.NullTime{Time: now, Valid: true}
+	// Use 'now' for both end time and processed time when updating
+	updateTime := sql.NullTime{Time: now, Valid: true}
 
 	// Fetch current state's total count within the transaction for accurate aggregation
 	var currentTotalCount int64
@@ -217,9 +221,12 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 		nextCursor = sql.NullString{} // Explicitly set to not update
 		nextSinceID = sql.NullInt64{} // Explicitly set to not update
 		nextBlogID = sql.NullInt64{}  // Explicitly set to not update
+		// Keep existing total count on failure
+		log.Printf("Marking %s as failed. Error: %s", entityType, lastError.String)
 	} else if hasNextPage {
 		status = "in_progress"
 		lastError = sql.NullString{Valid: false} // Clear error on success
+		log.Printf("Marking %s as in_progress. Processed %d this step. New Total: %d", entityType, processedCount, currentTotalCount+int64(processedCount))
 	} else {
 		status = "completed"
 		lastError = sql.NullString{Valid: false} // Clear error on success
@@ -227,6 +234,7 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 		nextCursor = sql.NullString{Valid: false}
 		nextSinceID = sql.NullInt64{Valid: false}
 		nextBlogID = sql.NullInt64{Valid: false}
+		log.Printf("Marking %s as completed. Processed %d this step. Final Total: %d", entityType, processedCount, currentTotalCount+int64(processedCount))
 	}
 
 	// Calculate new total processed count based on the *outcome*
@@ -237,20 +245,23 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 
 	// SQL query parts
 	setClauses := []string{
-		"last_sync_end_time = $1",
+		"last_sync_end_time = $1", // Records when this *step* finished or failed
 		"status = $2",
 		"last_error = $3",
 		"last_processed_count = $4",
 		"total_processed_count = $5",
+		// Always update last_processed_time on successful steps or completion
+		// Do not update last_processed_time on failure to preserve the time of the last *successful* operation for stale check
+		// REMOVED: "last_processed_time = $6", // << REMOVED standard update here
 	}
-	args := []interface{}{endTime, status, lastError, processedCount, newTotalCount} // Start with common args
-	argIdx := 6                                                                      // Next arg index is $6
+	args := []interface{}{updateTime, status, lastError, processedCount, newTotalCount} // Start with common args
+	argIdx := 6                                                                         // Next arg index is $6
 
-	// Conditionally update cursors/IDs based on status
+	// Conditionally update cursors/IDs AND last_processed_time based on status
 	if status == "in_progress" {
-		// Add more detailed progress tracking
-		setClauses = append(setClauses, fmt.Sprintf("last_processed_time = $%d", argIdx))
-		args = append(args, now)
+		// Update cursors and last processed time for ongoing sync
+		setClauses = append(setClauses, fmt.Sprintf("last_processed_time = $%d", argIdx)) // << ADDED here
+		args = append(args, updateTime)
 		argIdx++
 
 		setClauses = append(setClauses, fmt.Sprintf("last_cursor = $%d", argIdx))
@@ -263,17 +274,15 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 		args = append(args, nextBlogID)
 		argIdx++
 	} else if status == "completed" {
-		// Reset cursors/IDs on completion
+		// Reset cursors/IDs on completion AND update last processed time
 		setClauses = append(setClauses, "last_cursor = NULL")
 		setClauses = append(setClauses, "last_rest_since_id = NULL")
 		setClauses = append(setClauses, "current_blog_id = NULL")
-
-		// Still update the last_processed_time on completion
-		setClauses = append(setClauses, fmt.Sprintf("last_processed_time = $%d", argIdx))
-		args = append(args, now)
+		setClauses = append(setClauses, fmt.Sprintf("last_processed_time = $%d", argIdx)) // << ADDED here
+		args = append(args, updateTime)
 		argIdx++
 	}
-	// On 'failed' status, we intentionally don't update cursors/IDs
+	// On 'failed' status, we intentionally don't update cursors/IDs or last_processed_time
 
 	args = append(args, entityType) // Add entity_type for WHERE clause
 
@@ -283,6 +292,9 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 		WHERE entity_type = $%d
 	`, strings.Join(setClauses, ", "), argIdx)
 
+	// Log before executing
+	log.Printf("Executing UpdateSyncState for %s: Status=%s, Processed=%d, Total=%d, HasNext=%t, Err=%v",
+		entityType, status, processedCount, newTotalCount, hasNextPage, lastError.String)
 	// log.Printf("DEBUG: Update State Query: %s", query)
 	// log.Printf("DEBUG: Update State Args: %v", args)
 
@@ -292,20 +304,86 @@ func UpdateSyncState(ctx context.Context, tx pgx.Tx, entityType string, nextCurs
 		return fmt.Errorf("error executing sync state update for %s: %w", entityType, err)
 	}
 
-	log.Printf("Sync state updated for %s: Status=%s, NextCursor=%v, NextSinceID=%v, NextBlogID=%v, StepProcessed=%d, NewTotal=%d, Error=%v",
-		entityType, status, nextCursor.String, nextSinceID.Int64, nextBlogID.Int64, processedCount, newTotalCount, lastError.String)
+	// Log after successful update
+	// log.Printf("Sync state updated for %s: Status=%s, NextCursor=%v, NextSinceID=%v, NextBlogID=%v, StepProcessed=%d, NewTotal=%d, Error=%v",
+	// 	entityType, status, nextCursor.String, nextSinceID.Int64, nextBlogID.Int64, processedCount, newTotalCount, lastError.String)
+
 	return nil
 }
 
-// findNextEntityTypeToProcess selects which entity to sync next based on status order.
+// FindNextEntityTypeToProcess selects which entity to sync next based on status order.
+// ADDED: Includes check for stale 'in_progress' states.
 func FindNextEntityTypeToProcess(ctx context.Context, conn *pgx.Conn) (string, *SyncState, error) {
-	// 1. Check if any task is actively 'in_progress'
+	log.Println("Finding next entity to process...")
+
+	// --- BEGIN STALE CHECK ---
+	staleCheckTime := time.Now().Add(-staleThreshold)
+	log.Printf("Checking for 'in_progress' states older than %v (before %s)...", staleThreshold, staleCheckTime.Format(time.RFC3339))
+
+	rows, err := conn.Query(ctx, `
+		SELECT entity_type, last_processed_time
+		FROM shopify_sync_state
+		WHERE status = 'in_progress' AND last_processed_time IS NOT NULL AND last_processed_time < $1
+	`, staleCheckTime)
+
+	if err != nil && err != pgx.ErrNoRows {
+		log.Printf("Warning: Error querying for stale states: %v. Proceeding without reset.", err)
+	} else if err == nil {
+		// Need to process rows even if only one might exist
+		staleEntities := []string{}
+		for rows.Next() {
+			var entityType string
+			var lastProcessedTime sql.NullTime
+			if scanErr := rows.Scan(&entityType, &lastProcessedTime); scanErr != nil {
+				log.Printf("Warning: Error scanning stale state row: %v", scanErr)
+				continue
+			}
+			if lastProcessedTime.Valid { // Double check validity just in case
+				log.Printf("Found stale 'in_progress' state for entity: %s (Last processed: %s)", entityType, lastProcessedTime.Time.Format(time.RFC3339))
+				staleEntities = append(staleEntities, entityType)
+			}
+		}
+		rows.Close() // Close rows before executing next query
+
+		// Reset stale entities if any were found
+		if len(staleEntities) > 0 {
+			resetErrMsg := fmt.Sprintf("Automatically reset from stale 'in_progress' state (older than %v)", staleThreshold)
+			resetArgs := []interface{}{resetErrMsg, time.Now()}
+			placeholders := make([]string, len(staleEntities))
+			for i, entity := range staleEntities {
+				placeholders[i] = fmt.Sprintf("$%d", i+3) // Start placeholders from $3
+				resetArgs = append(resetArgs, entity)
+			}
+
+			resetQuery := fmt.Sprintf(`
+				UPDATE shopify_sync_state
+				SET status = 'failed',
+					last_error = $1,
+					last_sync_end_time = $2
+				WHERE entity_type IN (%s) AND status = 'in_progress'
+			`, strings.Join(placeholders, ","))
+
+			log.Printf("Executing reset for stale entities: %v", staleEntities)
+			_, updateErr := conn.Exec(context.Background(), resetQuery, resetArgs...) // Use background context for reset
+			if updateErr != nil {
+				log.Printf("ERROR: Failed to reset stale states (%v): %v", staleEntities, updateErr)
+				// Continue trying to find a task anyway
+			} else {
+				log.Printf("Successfully reset %d stale states to 'failed'.", len(staleEntities))
+			}
+		}
+	}
+	// --- END STALE CHECK ---
+
+	// 1. Check if any task is *now* actively 'in_progress' (could have been missed by stale check if last_processed_time was null)
 	var inProgressEntityType string
-	err := conn.QueryRow(ctx, `SELECT entity_type FROM shopify_sync_state WHERE status = 'in_progress' LIMIT 1`).Scan(&inProgressEntityType)
+	err = conn.QueryRow(ctx, `SELECT entity_type FROM shopify_sync_state WHERE status = 'in_progress' LIMIT 1`).Scan(&inProgressEntityType)
 	if err == nil {
 		// Found one already running
+		states, _ := getAllSyncStates(ctx, conn) // Fetch states for logging context
 		log.Printf("Sync cycle already in progress (task: %s). Waiting.", inProgressEntityType)
-		return "", nil, nil // Indicate nothing to process right now
+		log.Printf("Current States:\n%s", formatStatesForLog(states)) // Log current states
+		return "", nil, nil                                           // Indicate nothing to process right now
 	} else if err != pgx.ErrNoRows {
 		// Real error querying the state
 		return "", nil, fmt.Errorf("error checking for in_progress sync state: %w", err)
@@ -326,26 +404,78 @@ func FindNextEntityTypeToProcess(ctx context.Context, conn *pgx.Conn) (string, *
 		}
 	}
 
-	// 3. If no 'failed' or 'pending', check if all are 'completed' to start a new cycle
+	// 3. If no 'failed' or 'pending', check if all are 'completed'
 	allCompleted, err := checkAllSyncsCompleted(ctx, conn)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to check if all syncs completed: %w", err)
 	}
 
 	if allCompleted {
+		// --- Start New Cycle Logic ---
 		firstEntity := entityProcessingOrder[0]
 		log.Printf("All entities completed. Ready to start new cycle with: %s", firstEntity)
-		state, err := getSyncState(ctx, conn, firstEntity) // Get state for the first entity
+
+		// Reset the first entity to pending to kick off the new cycle
+		// Use background context for safety
+		resetCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := resetSingleSyncState(resetCtx, conn, firstEntity)
 		if err != nil {
-			return "", nil, fmt.Errorf("could not get state for first entity %s to restart cycle: %w", firstEntity, err)
+			log.Printf("ERROR: Failed to reset state for %s to start new cycle: %v", firstEntity, err)
+			return "", nil, fmt.Errorf("failed to reset state for new cycle: %w", err) // Propagate error
+		}
+		log.Printf("Reset state for %s to 'pending'.", firstEntity)
+
+		// Get the freshly reset state
+		state, err := getSyncState(ctx, conn, firstEntity)
+		if err != nil {
+			return "", nil, fmt.Errorf("could not get state for first entity %s after reset: %w", firstEntity, err)
 		}
 		return firstEntity, state, nil
+		// --- End New Cycle Logic ---
+
 	}
 
 	// If we reach here, it means nothing is 'in_progress', nothing is 'pending' or 'failed',
 	// but not everything is 'completed'. This implies some tasks finished, waiting for others.
 	log.Println("No 'pending' or 'failed' entities found, and not all are 'completed'. Waiting for next check.")
 	return "", nil, nil // Indicate nothing to process right now
+}
+
+// Helper to format states for logging
+func formatStatesForLog(states []*SyncState) string {
+	if states == nil {
+		return "Could not retrieve states."
+	}
+	var sb strings.Builder
+	jsonData, err := json.MarshalIndent(states, "", "  ")
+	if err != nil {
+		sb.WriteString(fmt.Sprintf("Error formatting states: %v", err))
+	} else {
+		sb.Write(jsonData)
+	}
+	return sb.String()
+}
+
+// Helper to reset a single entity state to pending
+func resetSingleSyncState(ctx context.Context, conn *pgx.Conn, entityType string) error {
+	_, err := conn.Exec(ctx, `
+        UPDATE shopify_sync_state
+        SET status = 'pending',
+            last_cursor = NULL,
+            last_rest_since_id = NULL,
+            current_blog_id = NULL,
+            last_error = NULL,
+            last_sync_start_time = NULL,
+            last_sync_end_time = NULL,
+            last_processed_count = 0,
+            total_processed_count = 0
+        WHERE entity_type = $1
+    `, entityType)
+	if err != nil {
+		return fmt.Errorf("failed to reset sync state for %s: %w", entityType, err)
+	}
+	return nil
 }
 
 // setSyncStateInProgress attempts to atomically claim an entity for processing.
